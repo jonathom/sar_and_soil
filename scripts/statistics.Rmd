@@ -1,0 +1,451 @@
+---
+title: "statistics"
+author: "Jonathan Bahlmann"
+date: "10/15/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+library(e1071)
+```
+
+## Load data
+Intensity and shapefile data is handled here.
+```{r loading-data, echo=FALSE}
+# load files as proxy
+int_VV <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH <- read_stars("VH_clip.tif", proxy=TRUE)
+# assign names
+names(int_VV) <- "VV"
+names(int_VH) <- "VH"
+# monitoring waters
+water_shape <- read_sf("water.shp")
+# study area
+study_area <- read_sf("study_area.shp")
+# shape
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV))
+# moni
+moni <- read_sf("moni_shap.shp")
+# double bounce
+db <- read_sf("double_bounce.shp")
+```
+
+## Load Rain Data
+```{r rain-data, echo=FALSE, warning=FALSE}
+rain_all <- read_stars("rain_clip.tif")
+all_days <- seq(as.Date("2018-01-01"), as.Date("2018-12-31"), by="days")
+study_area_rain <- st_transform(study_area, crs=st_crs(rain_all))
+# rain_all <- rain_all[shape_rain]
+rain_all <- st_set_dimensions(rain_all, 3, values = all_days, names = "time")
+# cut
+rain_all <- rain_all[study_area_rain[1,]]
+
+rain_all <- aggregate(rain_all, by="3 days", sum)
+rain.all.df <- as.data.frame(st_apply(rain_all, "time", mean, na.rm = TRUE))
+```
+
+## loadPolygon() for Smaller Polygons
+```{r load-polygon-function, echo=FALSE}
+dates <- c(ymd("2018-01-03"), ymd("2018-01-15"), ymd("2018-01-27"), ymd("2018-02-08"), ymd("2018-02-20"), ymd("2018-03-04"), ymd("2018-03-16"), ymd("2018-03-28"), ymd("2018-04-09"), ymd("2018-04-21"), ymd("2018-05-03"), ymd("2018-05-15"), ymd("2018-05-27"), ymd("2018-06-08"), ymd("2018-06-20"), ymd("2018-07-02"), ymd("2018-07-14"), ymd("2018-07-26"), ymd("2018-08-07"), ymd("2018-08-19"), ymd("2018-08-31"), ymd("2018-09-12"), ymd("2018-09-24"), ymd("2018-10-06"), ymd("2018-10-18"), ymd("2018-10-30"), ymd("2018-11-11"), ymd("2018-11-23"), ymd("2018-12-05"), ymd("2018-12-17"), ymd("2018-12-29"))
+
+loadPolygon <- function(shape) {
+# This polygon is being looked at: polyID
+int_vv <- st_as_stars(int_VV[shape])
+int_vh <- st_as_stars(int_VH[shape])
+int_vv <- st_set_dimensions(int_vv, 3, val = dates, names = "time")
+int_vh <- st_set_dimensions(int_vh, 3, val = dates, names = "time")
+# c()
+comb <- c(int_vv, int_vh, along="bands")
+# switch bands to attributes, this is more of a design choice.
+comb_split <- split(comb, "bands")
+names(comb_split) <- c("VV", "VH")
+return(comb_split)
+}
+```
+
+## Threshold Calculation
+### Water Detection
+```{r make-water-data, echo=FALSE, warning=FALSE}
+# prepare new data, WITHOUT STREET
+end <- length(water_shape$type)
+for (k in 1:end) {
+  if(water_shape[k,]$type != "mixed" && water_shape[k,]$type != "street") {
+    poly <- loadPolygon(water_shape[k,])
+    # set VV, timestep
+    poly <- poly[1,,,1]
+    poly.df <- as.data.frame(poly)
+    poly.df$type <- water_shape[k,]$type
+    poly.df <- poly.df[complete.cases(poly.df),]
+    if(k == 1) {
+      val.svm <- poly.df[,4:5]
+    }
+    else {
+      val.svm <- rbind(val.svm, poly.df[,4:5])
+    }
+  }
+}
+```
+
+```{r water-SVM, warning=FALSE}
+# prepare data
+val.svm$type <- as.factor(val.svm$type)
+attach(val.svm)
+x <- subset(val.svm, select=-type)
+y <- type
+# make model
+svmmod <- svm(x,y)
+# summary(svmmod)
+# make prediction, confusion matrix
+pred <- predict(svmmod,x)
+table(pred, y)
+# threshold is
+water_threshold <- svmmod$x.scale$`scaled:center`
+water_threshold
+# boxplot
+ggplot(val.svm, aes(x=type, y=VV)) +
+  geom_boxplot() +
+  geom_hline(yintercept = water_threshold)
+```
+
+### Double Bounce Detection
+```{r make-db-data, echo=FALSE}
+end <- length(db$type)
+for (k in 1:end) {
+  if(db[k,]$type != "mixed") {
+    poly <- loadPolygon(db[k,])
+    # set VV, timestep
+    poly <- poly[1,,,1]
+    poly.df <- as.data.frame(poly)
+    poly.df$type <- db[k,]$type
+    poly.df <- poly.df[complete.cases(poly.df),]
+    if(k == 1) {
+      val.db <- poly.df[,4:5]
+    }
+    else {
+      val.db <- rbind(val.db, poly.df[,4:5])
+    }
+  }
+}
+```
+
+```{r db-SVM, warning=FALSE}
+# prepare data
+val.db$type <- as.factor(val.db$type)
+attach(val.db)
+x <- subset(val.db, select=-type)
+y <- type
+# make model
+svm.db <- svm(x,y)
+# summary(svm.db)
+# make prediction, confusion matrix
+pred <- predict(svm.db,x)
+table(pred, y)
+# threshold is
+db_threshold <- svm.db$x.scale$`scaled:center`
+db_threshold
+# boxplot
+ggplot(val.db, aes(x=type, y=VV)) +
+  geom_boxplot() +
+  geom_hline(yintercept = db_threshold)
+```
+
+## Deprecated: time_apply(). A Function That uses For Loops to Iterate Through Processable Tile Sizes of Much Larger Extents
+```{r time-apply-function, echo=FALSE, warning=FALSE, eval=FALSE}
+time_apply <- function(ext, folderName) {
+                       
+  # bbox can be used for stars subsetting []
+  ext <- st_bbox(ext) # ext is xmin ymin xmax ymax
+  # study area one has 11860, 10.000 seems OK tile size
+  # calculate span
+  x.span <- ext[3] - ext[1] # X
+  y.span <- ext[4] - ext[2] # Y
+  # calc good number of cuts
+  x.cuts <- ceiling(x.span / 10000)
+  y.cuts <- ceiling(y.span / 10000)
+  # calc cut length
+  x.cut.by <- x.span / x.cuts
+  y.cut.by <- y.span / y.cuts
+
+  # tile counter
+  count <- 0
+  # go through all cuts in X direction
+  for (i in 1:x.cuts) {
+    # go through all cuts in Y direction
+    for (j in 1:y.cuts) {
+      count <- count + 1
+      # make extent object
+      xmin <- ext[1] + (i - 1) * x.cut.by
+      xmax <- ext[1] + i * x.cut.by
+      ymin <- ext[2] + (j - 1) * y.cut.by
+      ymax <- ext[2] + j * y.cut.by
+      
+      cutbox <- ext
+      cutbox[1] <- xmin
+      cutbox[2] <- ymin
+      cutbox[3] <- xmax
+      cutbox[4] <- ymax
+      
+      # cutbox <- extent(xmin, ymin, xmax, ymax)
+      
+      # load stars  
+      tile <- loadPolygon(cutbox)
+    
+      # create sum
+      for (k in 1:31) {
+        scene <- tile[1,,,k]
+        # order is important
+        scene[scene >= threshold] <- 1
+        scene[scene < threshold] <- 0
+        if(k == 1) {
+          class.sum.svm <- scene
+        }
+        else {
+          class.sum.svm <- class.sum.svm + scene
+        }
+      }
+      
+      # make name
+      if(count < 10) {
+        name <- paste0("./", folderName, "/tile_0", count, ".tif")
+      } else {
+        name <- paste0("./", folderName, "/tile_", count, ".tif")
+      }
+      # export
+      write_stars(class.sum.svm, name)
+
+    }
+  }
+}
+
+list <- list.files("./tiles")
+for (l in 1:length(list)) {
+  str <- paste0("./tiles/", list[l])
+  ras <- raster(str)
+  if(l < 2) {
+    allRas <- ras
+  }
+  else {
+    allRas <- raster::merge(allRas, ras)
+  }
+}
+writeRaster(allRas, "allRas.tif", overwrite=TRUE)
+```
+
+## Try lapply(), Define Functions
+```{r lapply-chunk, echo=FALSE}
+# make list to lapply to
+make.extent.list <- function(shape) {
+  extent.list <- list()
+  ext <- st_bbox(shape)
+  x.span <- ext[3] - ext[1] # X calculate span
+  y.span <- ext[4] - ext[2] # Y
+  x.cuts <- ceiling(x.span / 10000) # calc good number of cuts
+  y.cuts <- ceiling(y.span / 10000)
+  x.cut.by <- x.span / x.cuts # calc cut length
+  y.cut.by <- y.span / y.cuts
+  count <- 0 # tile counter
+  for (i in 1:x.cuts) { # go through all cuts in X direction  
+    for (j in 1:y.cuts) { # go through all cuts in Y direction
+      count <- count + 1
+      xmin <- ext[1] + (i - 1) * x.cut.by
+      xmax <- ext[1] + i * x.cut.by
+      ymin <- ext[2] + (j - 1) * y.cut.by
+      ymax <- ext[2] + j * y.cut.by
+      # replace extents
+      cutbox <- ext
+      cutbox[1] <- xmin
+      cutbox[2] <- ymin
+      cutbox[3] <- xmax
+      cutbox[4] <- ymax
+      
+      extent.list[[count]] <- cutbox
+    }
+  }
+  return(extent.list)
+}
+
+tile.and.sum <- function(cutbox, threshold, folderName, count) {
+  # print(cutbox)
+  tile <- loadPolygon(cutbox)
+  # create sum
+  for (k in 1:31) {
+    scene <- tile[1,,,k]
+    # order is important
+    scene[scene >= threshold] <- 1
+    scene[scene < threshold] <- 0
+    if(k == 1) {
+      class.sum <- scene
+    }
+    else {
+      class.sum <- class.sum + scene
+    }
+  }
+  
+  # make name
+  if(count < 10) {
+    name <- paste0("./", folderName, "/tile_0", count, ".tif")
+  } else {
+    name <- paste0("./", folderName, "/tile_", count, ".tif")
+  }
+  # export
+  write_stars(class.sum, name)
+}
+
+# cutbox is bounding box, interval is c(lower threshold, upper threshold), count is index of lapply func
+tile.and.ts <- function(cutbox, interval, count) {
+  years <- list()
+  tile <- loadPolygon(cutbox)
+  
+  for (j in 1:31) {
+    tile[tile > interval[2]] <- NA
+    tile[tile < interval[1]] <- NA
+    tile_mean <- as.data.frame(st_apply(tile[1,,,j], "time", mean, na.rm = TRUE))
+    # tile_sd <- as.data.frame(st_apply(tile[1,,,j], "time", sd, na.rm = TRUE))
+    tile_df <- tile_mean
+    # tile_df <- merge(tile_mean, tile_sd)
+    if(j == 1) {
+      df <- tile_df
+    }
+    else {
+      df <- rbind(df, tile_df)
+    }
+  }
+  years[[count]] <- df
+  # print(df)
+}
+```
+
+## Make Raster With lapply
+
+The Issue here is to be able to load and threshold a large area of interest, although the complete `stars` object is too big for RAM. It is therefore tiled and processed individually. This is here done with lappply, after the above approach using for-loops.
+```{r do-lapply, warning=FALSE, eval=FALSE, echo=FALSE}
+# name folderName
+fileName <- "./lapply_test_tiles"
+# make an extent list from the bigger extent
+extent.list <- make.extent.list(study_area[3,])
+# lapply
+obj <- lapply(1:length(extent.list), function(x) { tile.and.sum(extent.list[[x]], water_threshold, fileName, x) } )
+# make one big raster
+list <- list.files(fileName)
+for (l in 1:length(list)) {
+  str <- paste0(fileName, "/", list[l])
+  ras <- raster(str)
+  if(l < 2) {
+    allRas <- ras
+  }
+  else {
+    allRas <- raster::merge(allRas, ras)
+  }
+}
+writeRaster(allRas, "allRas.tif", overwrite=TRUE)
+```
+
+```{r}
+allRas <- raster("allRas.tif")
+plot(allRas)
+```
+
+### Deprecated but interesting: Time Series in Single Time Step Evaluation: What are the non-water, non-double-bounce pixels doing aka how is bare, not flooded soil reacting to rain events?
+
+Classification is done for every time step. That means that all water pixels of a specific date are excluded from analysis.
+```{r lapply-TS, eval = FALSE, echo=FALSE}
+# make smaller extent object
+extent.list4mean <- make.extent.list(study_area[1,])
+# do lapply
+means <- lapply(1:length(extent.list4mean), function(x) { tile.and.ts(extent.list4mean[[x]], c(water_threshold, db_threshold), x)})
+# bind to one df
+  # create df template
+  allmeans <- means[[1]]
+  allmeans <- allmeans[,1:2]
+# go through means df ...
+for (i in 2:length(means)) {
+  app <- means[[i]]
+  # .. and cbind all of it
+  allmeans <- cbind(allmeans, app[,2])
+}
+# calc rowmeans
+allmeans$Mean <- rowMeans(allmeans[,2:ncol(allmeans)])
+saveRDS(allmeans, "allmeans_single_time_stepped.rds")
+```
+
+```{r plot-single-stepped, warning=FALSE}
+# This file is study_area[1,]
+allmeans <- readRDS("allmeans_single_time_stepped.rds")
+ggplot() +
+  geom_line(aes(x = allmeans$time, y = allmeans$Mean + 16)) +
+  geom_bar(aes(x = rain.all.df$time, y = rain.all.df$mean / 2), stat='identity') + ylab("VV + 16") + xlab("time") + ggtitle("Precipitation (3 day sum / 2) and Overall Mean of VV-Backscatter (+16) \nof all Areas not Classified as Water or Double Bounce \n(in the Corresponding Timestep, Area = Moorflächen)")
+```
+
+## Connecting TS and the Classification Raster: How Does Surface that is Neither Everytime nor Never Classified as Water (Surfaces with Alternating Moisture Content) Reacting to Rain Events?
+```{r connecting-ts-and-raster, echo=FALSE, eval=FALSE, warning=FALSE, eval=FALSE}
+tile.raster.ts <- function(cutbox, count) {
+  years <- list()
+  tile <- loadPolygon(cutbox)
+  if(count < 10) {
+    name <- paste0("tile_0", count, ".tif")
+  } else {
+    name <- paste0("tile_", count, ".tif")
+  }
+  control <- raster(paste0("./lapply_test_tiles/", name))
+  control <- st_as_stars(control)
+  
+  for (j in 1:31) {
+    tile[control > 29] <- NA
+    tile[control < 3] <- NA
+    tile_mean <- as.data.frame(st_apply(tile[1,,,j], "time", mean, na.rm = TRUE))
+    tile_sd <- as.data.frame(st_apply(tile[1,,,j], "time", sd, na.rm = TRUE))
+    tile_df <- merge(tile_mean, tile_sd)
+    if(j == 1) {
+      df <- tile_df
+    }
+    else {
+      df <- rbind(df, tile_df)
+    }
+  }
+  years[[count]] <- df
+  # print(df)
+}
+
+# use same extent object as above
+# extent.list4mean <- make.extent.list(study_area[2,])
+# do lapply
+means.Control <- lapply(1:length(extent.list4mean), function(x) { tile.raster.ts(extent.list4mean[[x]], x)})
+# bind to one df
+  # create df template
+  allmeans.Control <- means.Control[[1]]
+  allmeans.Control <- allmeans.Control[,1:2]
+# go through means df ...
+for (i in 2:length(means.Control)) {
+  app.Control <- means.Control[[i]]
+  # .. and cbind all of it
+  allmeans.Control <- cbind(allmeans.Control, app.Control[,2])
+}
+# calc rowMeans
+allmeans.Control$Mean <- rowMeans(allmeans.Control[,2:ncol(allmeans.Control)])
+
+saveRDS(allmeans.Control, "allmeans_with_control_class_raster.rds")
+```
+
+```{r load-control-raster-rds}
+# study_area[1,]
+allmeans.Control <- readRDS("allmeans_with_control_class_raster.rds")
+# and plot
+ggplot() +
+  geom_line(aes(x = allmeans.Control$time, y = allmeans.Control$Mean + 16)) +
+  geom_bar(aes(x = rain.all.df$time, y = rain.all.df$mean / 2), stat='identity') + ylab("VV + 16") + xlab("time") + ggtitle("Precipitation (3 day sum / 2) and Overall Mean of VV-Backscatter (+16) \nof all Areas with Alternating Moisture Content \n(All Between 2 and 30 Counts, Area = Moorflächen))")
+```

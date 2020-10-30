@@ -1,0 +1,246 @@
+---
+title: "SAR and Soil Moisture"
+author: "Jonathan Bahlmann"
+# date: "`r format(Sys.time(), "%d.%m.%Y")`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Packages and wd
+```{r, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+```
+
+### Clipping of Intensity bands and precipitation dataset
+is done with `gdal_translate -projwin 715088 5864849 773006 5840651 -projwin_srs "EPSG:25832" "D:/COPY/BEWAMO/intensity_2018_vh.tif" "D:/soil_moist/VH_clip.tif"`
+The window is (X,Y) UL 715088 5864849 LR 773006 5840651. It was done to shrink the amount of data that has to be loaded into memory (in case we need to load whole datasets).
+
+### loading data
+`read_stars` is used. option `proxy = TRUE` keeps the data from being read into memory. However proxy and non-proxy ('pure' stars) objects can't be combined with `c()` operator. So either precipitation dataset is only combined later in dataframes or intensity bands must be read into memory. We keep the big rasters as proxies as long as possible and load them later, when we also subset into the polygon of interest.
+
+#### tif datasets
+```{r}
+int_VV <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH <- read_stars("VH_clip.tif", proxy=TRUE)
+rain <- read_stars("rain_clip.tif")
+```
+
+#### shape
+transform into crs of intensity dataset.
+```{r}
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV))
+```
+
+## aggregate rain data
+Rain data is summarized over 3 days. Of these 3 day-sums, every 4th sum is selected to match sentinel 1 acquisition dates. 9 days between sums are not included in dataset.
+```{r}
+# sequence of all days in 2018
+all_days <- seq(as.Date("2018-01-01"), as.Date("2018-12-31"), by="days")
+# assign to rain stars
+rain <- st_set_dimensions(rain, 3, values = all_days, names = "time")
+# summarize every three days
+rain <- aggregate(rain, by="3 days", sum)
+# sequence of every fourth sum, so that sums then correspond to intensity dates
+i <- as.vector(seq(from = 1, length.out = 31, by = 4))
+# select from rain dataset. 3-day-sums from days before a S 1 acquisition.
+rain <- rain[,i,,]
+```
+
+### warp rain dataset to exact geometry of intensity dataset
+This is done with the aggregated data to lower workload.
+```{r}
+rain <- st_warp(rain, int_VV)
+```
+
+### dimensions and names
+Dimensions cannot be assigned to proxy. We only assign to rain here.
+```{r}
+# these are the sentinel 1 acqusition dates
+dates <- c(ymd("2018-01-03"), ymd("2018-01-15"), ymd("2018-01-27"), ymd("2018-02-08"), ymd("2018-02-20"), ymd("2018-03-04"), ymd("2018-03-16"), ymd("2018-03-28"), ymd("2018-04-09"), ymd("2018-04-21"), ymd("2018-05-03"), ymd("2018-05-15"), ymd("2018-05-27"), ymd("2018-06-08"), ymd("2018-06-20"), ymd("2018-07-02"), ymd("2018-07-14"), ymd("2018-07-26"), ymd("2018-08-07"), ymd("2018-08-19"), ymd("2018-08-31"), ymd("2018-09-12"), ymd("2018-09-24"), ymd("2018-10-06"), ymd("2018-10-18"), ymd("2018-10-30"), ymd("2018-11-11"), ymd("2018-11-23"), ymd("2018-12-05"), ymd("2018-12-17"), ymd("2018-12-29"))
+# assign to rain ds
+rain <- st_set_dimensions(rain, 3, values = dates, names = "time")
+```
+
+Assign attribute names:
+
+```{r}
+names(int_VV) <- "VV"
+names(int_VH) <- "VH"
+names(rain) <- "prec"
+```
+
+### Bind
+
+#### proxy -> memory
+Select polygon to scale down dataset and load into memory with `st_as_stars`. Because rain is not a proxy and we can't combine it with proxy objects.
+```{r}
+# select polygon nr 124, the approximately largest area in sponsorship
+# it seems important to do this seperately for the both int bands
+int_vv <- st_as_stars(int_VV[shape[124,]])
+int_vh <- st_as_stars(int_VH[shape[124,]])
+# set dimensions to match rain dimensions
+int_vv <- st_set_dimensions(int_vv, 3, values = dates, names = "time")
+int_vh <- st_set_dimensions(int_vh, 3, values = dates, names = "time")
+# class is now
+class(int_vv)
+```
+
+#### combine
+Then combine all three. Give `along = "bands"` so that all attributes are treated as bands.
+```{r}
+# c()
+comb <- c(int_vv, int_vh, rain[shape[124,]], along="bands")
+# comb is now
+comb
+```
+
+### Change bands back to attributes
+
+```{r}
+comb_split <- split(comb, "bands")
+# Gotta assign new names now, in order we combined them.
+names(comb_split) <- c("VV", "VH", "prec")
+comb_split
+```
+
+### Aggregate spatially
+We want a time series of the reflectance and precipitation for the whole polygon (whole dataset). Using `st_apply` to aggregate.
+```{r}
+comb_aggr <- st_apply(comb_split, "time", mean, na.rm = TRUE)
+# and write as.data.frame for structure
+dff <- as.data.frame(comb_aggr)
+```
+
+### plot
+Keep in mind that precipitation data is a 3-day sum with 9-day breaks, ignoring all other precipitation in that period.
+```{r}
+ggplot(dff, aes(x=time)) +
+  geom_line(aes(y = VV, color="VV")) +
+  geom_line(aes(y = VH, color="VH")) +
+  geom_bar(aes(y = prec), stat='identity') +
+  ylab("Precipitation in mm/m and VV in dB") +
+  scale_color_manual(name="Polarization", values=c(VV="red", VH="blue"))
+```
+
+## Alternative: aggregate rain every X days
+When we handle intensity and rain data independent of each other, we can accumulate rain at independent dates. rain dates then don't need to exactly match intensity data. Also: The above method only worked because S 1 data starts on 03/01 in the first place.
+```{r}
+# load
+rainx <- read_stars("rain_clip.tif")
+# set dims (all days)
+rainx <- st_set_dimensions(rainx, 3, values = all_days, names = "time")
+```
+Now aggregate by X days. In this case: 6
+```{r}
+# aggregate
+rainx <- aggregate(rainx, by="6 days", sum)
+# warp again
+rainx <- st_warp(rainx, int_VV)
+# select shape
+rainx <- rainx[shape[124,]]
+```
+When looking at the rainx dates (typing `rainx` and looking at offset; or `plot(rainx)`) we notice that the 6 day sums are dated on the first day of their sum. That is inconvenient for plotting them against intensity. We therefore date them onto the last day of their sum.
+
+Also `st_apply` and `as.data.frame`.
+```{r}
+# set actual dates
+calc.days <- seq(as.Date("2018-01-06"), as.Date("2018-12-31"), by="6 days")
+rainx <- st_set_dimensions(rainx[,,,1:60], 3, values = calc.days, names = "time")
+# resolve, same as above
+rain.a <- st_apply(rainx, "time", mean, na.rm = TRUE)
+rain.df <- as.data.frame(rain.a)
+```
+
+### Merge with intensity data to data frame
+The main difference is that this time, we merge rain and int only at the dataframe level, not into a single stars object.
+```{r}
+# merge the above rain df and the intensity part of dff
+# we need all x and y to keep all dates, not just the overlapping ones
+ms <- merge(rain.df, dff[,1:3], all.x=TRUE, all.y=TRUE)
+# change 'mean' to 'prec'
+names(ms) <- c("time", "prec", "VV", "VH")
+```
+Since we now have a bunch of NAs we should do something with them.
+```{r}
+# ms stays our not approximated df
+ms.app <- ms
+# na.approx
+ms.app$prec <- na.approx(as.vector(ms$prec), na.rm="FALSE")
+ms.app$VV <- na.approx(as.vector(ms$VV), na.rm="FALSE")
+ms.app$VH <- na.approx(as.vector(ms$VH), na.rm="FALSE")
+# values that couldn't be approximated are set as 0
+ms.app[is.na(ms.app)] <- 0
+#
+# ms.app[1,3] <- -11.9
+```
+
+## Results
+let's see. This shows us a 6 day precipitation sum with no breaks. So 6 days sum every 6 days. Keep in mind that precipitation fell over all the preceding 6 days.
+```{r}
+ggplot(ms.app, aes(x=time)) +
+  geom_bar(aes(y = prec), stat='identity') +
+  geom_line(aes(y = VV, color = "VV")) +
+  geom_line(aes(y = VH, color = "VH")) +
+  ylab("Precipitation in mm/m and -VV in dB") +
+  scale_color_manual(name="Polarization", values=c(VV="red", VH="blue"))  
+```
+
+And for comparison, the 3-day sum + 9-day break with no approximation in intensity dataset:
+
+```{r, echo = FALSE}
+ggplot(dff, aes(x=time)) +
+  geom_line(aes(y = VV, color="VV")) +
+  geom_line(aes(y = VH, color="VH")) +
+  geom_bar(aes(y = prec), stat='identity') +
+  ylab("Precipitation in mm/m and VV in dB") +
+  scale_color_manual(name="Polarization", values=c(VV="red", VH="blue"))
+```
+
+## Try a difference VV - VH
+
+```{r}
+# should be easy in df
+ms.app$diff <- ms.app$VV - ms.app$VH
+ms.app$diff.swap <- ms.app$VH - ms.app$VV
+ggplot(ms.app, aes(x=time)) +
+  geom_bar(aes(y = prec), stat='identity') +
+  geom_line(aes(y = VV, color = "VV")) +
+  geom_line(aes(y = VH, color = "VH")) +
+  geom_line(aes(y = diff, color = "DifferenceVV_VH")) +
+# geom_line(aes(y = diff.swap, color = "DifferenceVH_VV")) +
+  ylab("Precipitation in mm/m and -VV in dB") +
+  scale_color_manual(name="Polarization", values=c(VV="red", VH="blue", DifferenceVV_VH="green"
+# ,DifferenceVH_VV="lightgreen"
+  ))
+```
+
+Try this in stars object.
+```{r}
+# assign difference to new attribute
+comb_split$VVminusVH <- comb_split["VV",,,] - comb_split["VH"]
+# collapse time dimension / build mean over time
+comb_spat <- st_apply(comb_split, c("x", "y"), mean, na.rm=TRUE)
+```
+
+Try this as RGB
+```{r, warning=FALSE}
+ras <- as(comb_spat, "Raster") # surpress warnings
+```
+```{r}
+plotRGB(ras, r=1, g=2, b=4, stretch="lin") # VV, VH, Diff
+```

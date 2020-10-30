@@ -1,0 +1,330 @@
+---
+title: "Characterize by Change"
+author: "Jonathan Bahlmann"
+date: "10/26/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+library(e1071)
+```
+
+## Load data
+Intensity and shapefile data is handled here.
+```{r loading-data, echo=FALSE}
+# load files as proxy
+int_VV_2017 <- read_stars("VV_2017_clip.tif", proxy=TRUE)
+int_VH_2017 <- read_stars("VH_2017_clip.tif", proxy=TRUE)
+int_VV_2018 <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH_2018 <- read_stars("VH_clip.tif", proxy=TRUE)
+# assign names
+names(int_VV_2017) <- "VV"
+names(int_VH_2017) <- "VH"
+names(int_VV_2018) <- "VV"
+names(int_VH_2018) <- "VH"
+# monitoring waters
+water_shape_2017 <- read_sf("water (copy).shp")
+water_shape_2018 <- read_sf("water.shp")
+water_shape_2017_july07 <- read_sf("water_shape_intersec.shp")
+# study area
+study_area <- read_sf("study_area.shp")
+# shape
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV_2018))
+# moni
+moni <- read_sf("moni_shap.shp")
+# double bounce
+db <- read_sf("double_bounce.shp")
+
+# water_general <- water_shape_2017[lengths(st_intersects(water_shape_2017, water_shape_2018)) != 0,]
+```
+
+```{r make-dates}
+# make dates
+info = gdalinfo("VV_2017_clip.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+dates2017 <- as_date(descr)
+
+info = gdalinfo("VV_clip.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+dates2018 <- as_date(descr)
+```
+
+```{r}
+# make proxy of both years
+proxy1718 <- c(int_VV_2017, int_VV_2018, along = "band")
+# c() dates
+dates <- c(dates2017, dates2018)
+```
+
+```{r load-polygon-func}
+# function takes a shape as an AOI and a year (2017 or 2018)
+loadPolygon <- function(shape, interval) {
+  dates <- dates[interval[1]:interval[2]]
+  int_vv <- st_as_stars(proxy1718[shape], along = "band")
+  int_vv <- int_vv[,,,interval[1]:interval[2]]
+  int_vv <- st_set_dimensions(int_vv, 3, val = dates, names = "time")
+  names(int_vv) <- c("VV")
+  return(int_vv)
+}
+```
+
+## Make Thresholded Rasters
+```{r, warning=FALSE}
+
+#### calculate length of intervals of no change #
+calcChangeLength <- function(freq) {
+  # count streaks of change / no change
+  counts <- rle(freq)
+  # convert to matrix
+  counts <- matrix(c(counts[[1]], counts[[2]]), ncol = length(counts[[1]]), byrow = TRUE)
+  # rounded mean streak length of 'no change'
+  round(mean(counts[1, counts[2,] == 0]))
+}
+
+#### stitch rasters from folders ################
+stitchRasters <- function(dirName, folderName, fileName, dates) {
+  dir_list <- list.files(dirName)
+  for (a in 1:length(dir_list)) {
+    str <- paste0(dirName, "/", dir_list[a])
+    ras <- raster(str)
+    if(a < 2) {
+      allRas <- ras
+    } else {
+      allRas <- raster::merge(allRas, ras)
+    }
+  }
+  name <- paste0("/", fileName, "_", dates[1], "_", dates[2], "flag.tif")
+  writeRaster(allRas, paste0(folderName, name), overwrite = TRUE)
+}
+
+#### characterize function #######################
+characterize <- function(ext, interval, thresholds, cdt, folderName) {
+  
+  # make the folders
+  dir.create(folderName)
+  
+  change_dir <- paste0(folderName, "/change_count_tiles")
+  dir.create(change_dir)
+  
+  range_dir <- paste0(folderName, "/change_range_tiles")
+  dir.create(range_dir)
+  
+  mean_dir <- paste0(folderName, "/mean_tiles")
+  dir.create(mean_dir)
+  
+  freq_dir <- paste0(folderName, "/change_freq_tiles")
+  dir.create(freq_dir)
+  
+  thresh_dir <- paste0(folderName, "/threshold_count_tiles")
+  dir.create(thresh_dir)
+  
+  #### TILING ####################################
+  # bbox can be used for stars subsetting []
+  ext <- st_bbox(ext) # ext is xmin ymin xmax ymax
+  # study area one has 11860, 10.000 seems OK tile size
+  # calculate span
+  x.span <- ext[3] - ext[1] # X
+  y.span <- ext[4] - ext[2] # Y
+  # calc good number of cuts
+  x.cuts <- ceiling(x.span / 10000)
+  y.cuts <- ceiling(y.span / 10000)
+  # calc cut length
+  x.cut.by <- x.span / x.cuts
+  y.cut.by <- y.span / y.cuts
+  
+  # tile counter
+  count <- 0
+  # go through all cuts in X direction
+  for (i in 1:x.cuts) {
+    # go through all cuts in Y direction
+    for (j in 1:y.cuts) {
+      count <- count + 1
+      # make extent object
+      xmin <- ext[1] + (i - 1) * x.cut.by
+      xmax <- ext[1] + i * x.cut.by
+      ymin <- ext[2] + (j - 1) * y.cut.by
+      ymax <- ext[2] + j * y.cut.by
+      
+      cutbox <- ext
+      cutbox[1] <- xmin
+      cutbox[2] <- ymin
+      cutbox[3] <- xmax
+      cutbox[4] <- ymax
+      
+      #### DO FOR EACH TILE #####################
+      
+      # make tile name
+      if(count < 10) {
+        name <- paste0("/tile_0", count, ".tif")
+      } else {
+        name <- paste0("/tile_", count, ".tif")
+      }
+      
+      # load stars  
+      tile <- loadPolygon(cutbox, interval)
+      
+      # make 0 change_count obj
+      change_count <- tile[,,,1]
+      change_count[change_count < 1000] <- 0
+      
+      # assign full time span stars to build mean frequency
+      stars_freq <- tile
+      
+      lengt <- length(interval[1]:interval[2])
+      leng <- lengt - 1
+      # go through time steps of tile
+      for (k in 1:leng) {
+        mag <- abs(abs(tile[,,,k]) - abs(tile[,,,k+1]))
+        # direction of change can be extracted with one less "abs" and sum
+        mag[mag < cdt] <- 0
+        mag[mag >= cdt] <- 1
+        change_count <- change_count + mag
+        
+        # frequency of change
+        if(k < 2) {
+          # create freq as first change image
+          freq <- mag
+        } else {
+          # bind new mag to freq to get time series of change
+          freq <- c(freq, mag)
+        }
+      }
+      
+      write_stars(change_count, paste0(change_dir, name))
+      
+      freq <- st_apply(freq, c("x", "y"), FUN = calcChangeLength)
+      write_stars(freq, paste0(freq_dir, name))
+      
+      # change range 
+      # mask changes from < cdt ?
+      range_max <- st_apply(tile, c("x", "y"), FUN = "max")
+      range_min <- st_apply(tile, c("x", "y"), FUN = "min")
+      range <- range_max - range_min
+      
+      # rescale
+      # max_value <- interval[2] - interval[1] + 1
+      # range <- rescale(range, to = c(0, max_value))
+      
+      write_stars(range, paste0(range_dir, name))
+      
+      # mean
+      tile_mean <- st_apply(tile, c("x", "y"), mean)
+      write_stars(tile_mean, paste0(mean_dir, name))
+      
+      
+      # TODO
+      # crs = 25832
+      # band names?
+      # direction of change (like r.walk?)
+      # any possibility to rescale range to count?
+      # account for speckle -> load tile as averaged 2x2 / 3x3 ?
+      
+      # create thresholds sum
+      for (l in 1:lengt) {
+        scene <- tile[,,,l]
+        scene[scene > thresholds[2]] <- 0
+        scene[scene < thresholds[1]] <- 0
+        scene[scene != 0] <- 1
+        
+        if(l == 1) {
+          thresh_sum <- scene
+        }
+        else {
+          thresh_sum <- thresh_sum + scene
+        }
+      }
+      # write
+      write_stars(thresh_sum, paste0(thresh_dir, name))
+    }
+  }
+  
+  # stitch rasters
+  dateName <- c(dates[interval[1]], dates[interval[2]])
+  
+  stitchRasters(change_dir, folderName, "change_count", dateName)
+  stitchRasters(freq_dir, folderName, "change_freq", dateName)
+  stitchRasters(range_dir, folderName, "change_range", dateName)
+  stitchRasters(mean_dir, folderName, "mean", dateName)
+  stitchRasters(thresh_dir, folderName, "thresh_count", dateName)
+  
+  # make VRT and TIF from all
+  # flag keeps preexisting raster from being included
+  raster_list <- list.files(folderName, rec=FALSE, pattern = "*flag.tif")
+  raster_list <- paste0(folderName, "/", raster_list)
+  
+  tifName <- paste0(folderName, "/all_", dateName[1], "_", dateName[2], ".tif")
+  
+  writeRaster(raster::stack(raster(raster_list[1]), raster(raster_list[2]), raster(raster_list[3]), raster(raster_list[4]), raster_list[5]), tifName, overwrite = TRUE)
+  
+  print("bands are in order:")
+  print(raster_list)
+  
+  # vrtName <- paste0(folderName, "/all_", dateName[1], "_", dateName[2], ".vrt")
+  # gdalbuildvrt(raster_list, vrtName, overwrite = TRUE, separate = TRUE)
+  # gdal_translate(vrtName, tifName, overwrite = TRUE)
+  
+}
+```
+
+```{r}
+## enter parameters
+## folder name of this specific run with ./
+folderName <- "./charac_one_year_change-6"
+## extent
+ext <- study_area[1,]
+## time span interval 1,29 is 2017, 30,60 is 2018
+interval <- c(1,29)
+#
+thresholds <- c(-22.5, -17.6)
+## change detection threshold, in dB (sensitivity of change detection)
+cdt <- 6
+
+characterize(ext, interval, thresholds, cdt, folderName)
+```
+
+```{r}
+interval <- c(1,30)
+
+check_water <- st_read("check_water_change.shp")
+
+tile <- loadPolygon(check_water, c(1,60))
+cdt <- 2
+change_count <- tile[,,,1]
+change_count[change_count < 1000] <- 0
+
+for (k in 1:7) {
+  mag <- abs(abs(tile[,,,k]) - abs(tile[,,,k+1]))
+  # direction of change can be extracted with one less "abs" and sum
+  mag[mag < cdt] <- 0
+  mag[mag >= cdt] <- 1
+  plot(change_count)
+  change_count <- change_count + mag
+  
+  
+}
+
+check_water <- st_read("check_water_change.shp")
+tile <- loadPolygon(check_water[2,], c(1,60))
+
+plot(tile)
+ts <- st_apply(tile, "time", FUN = "mean", na.rm = TRUE)
+dg <- as.data.frame(ts)
+plot(VV ~ time, data = dg, type = "l")
+````

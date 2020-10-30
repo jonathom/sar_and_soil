@@ -1,0 +1,355 @@
+---
+title: "Investigating wetland scatter"
+author: "Jonathan Bahlmann"
+# date: "`r format(Sys.time(), "%d.%m.%Y")`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading Data
+Set wd and load packages.
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+```
+
+## As stars proxy
+Intensity data is handled here.
+```{r, echo=FALSE}
+# load files as proxy
+int_VV <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH <- read_stars("VH_clip.tif", proxy=TRUE)
+# assign names
+names(int_VV) <- "VV"
+names(int_VH) <- "VH"
+# transform shape into crs of intensity dataset
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV))
+```
+
+## Spatial Extent
+The desired spatial extent can be set via subsetting: `[extent_object]`.
+```{r, echo=FALSE}
+# now load extent (polygon) into memory
+int_vv <- st_as_stars(int_VV[shape[124,]])
+int_vh <- st_as_stars(int_VH[shape[124,]])
+```
+
+## Time Dimension
+```{r}
+dates <- c(ymd("2018-01-03"), ymd("2018-01-15"), ymd("2018-01-27"), ymd("2018-02-08"), ymd("2018-02-20"), ymd("2018-03-04"), ymd("2018-03-16"), ymd("2018-03-28"), ymd("2018-04-09"), ymd("2018-04-21"), ymd("2018-05-03"), ymd("2018-05-15"), ymd("2018-05-27"), ymd("2018-06-08"), ymd("2018-06-20"), ymd("2018-07-02"), ymd("2018-07-14"), ymd("2018-07-26"), ymd("2018-08-07"), ymd("2018-08-19"), ymd("2018-08-31"), ymd("2018-09-12"), ymd("2018-09-24"), ymd("2018-10-06"), ymd("2018-10-18"), ymd("2018-10-30"), ymd("2018-11-11"), ymd("2018-11-23"), ymd("2018-12-05"), ymd("2018-12-17"), ymd("2018-12-29"))
+int_vv <- st_set_dimensions(int_vv, 3, values = dates, names = "time")
+int_vh <- st_set_dimensions(int_vh, 3, values = dates, names = "time")
+```
+
+## Rain
+Needs to be freshly warped for some reason, can't be saved (`write_stars`) and then loaded. But: rain_warped.tif is a file with already aggregated rain data (31 time steps instead of 365).
+```{r, echo=FALSE}
+# rain <- read_stars("rain_warped.tif", proxy=TRUE)
+# names(rain) <- "prec"
+# rain <- st_warp(rain, int_VV)
+rain <- readRDS("rain_warped_3daysum.rds")
+rain <- rain[shape[124,]]
+rain <- st_set_dimensions(rain, 3, values = dates, names = "time")
+```
+## Combine
+Then combine all three. Give `along = "bands"` so that all attributes are treated as bands.
+```{r, echo=FALSE}
+# c()
+comb <- c(int_vv, int_vh, rain, along="bands")
+```
+## switch bands to attributes
+This is more of a design choice.
+```{r}
+comb_split <- split(comb, "bands")
+names(comb_split) <- c("VV", "VH", "prec")
+comb_split
+```
+
+# Data Exploration
+
+## Time Series for One Single Pixel
+```{r}
+# get one pixel ts (at 10/10)
+pixel.df <- as.data.frame(comb_split[1,100,100,])
+pixel.df <- cbind(pixel.df, comb_split[2,100,100])
+pixel.df <- cbind(pixel.df, comb_split[3,100,100])
+pixel.df <- pixel.df[,c(3,4,8,12)]
+# calculate additional measures
+names(pixel.df) <- c("time", "VV", "VH", "prec")
+pixel.df$sum <- pixel.df$VV + pixel.df$VH
+pixel.df$diff <- pixel.df$VV - pixel.df$VH
+pixel.df$ratio <- (pixel.df$VV / pixel.df$VH)
+# plot all
+ggplot() + 
+  geom_bar(aes(x=pixel.df[,1], y=pixel.df$prec), stat='identity') +
+  geom_line(aes(x=pixel.df[,1], y=pixel.df$VV, color="VV")) + 
+  geom_line(aes(x=pixel.df[,1], y=pixel.df$VH, color="VH")) + 
+  geom_line(aes(x=pixel.df[,1], y=pixel.df$sum, color="sum")) + 
+  geom_line(aes(x=pixel.df[,1], y=pixel.df$diff, color="diff")) + 
+  geom_line(aes(x=pixel.df[,1], y=pixel.df$ratio, color="ratio")) +
+  scale_color_manual(name="Polarization", values=c(VV="red", VH="blue", sum="lightgreen", diff="forestgreen", ratio="yellow"))
+# take a look at the ratio
+ggplot() +
+    geom_line(aes(x=pixel.df[,1], y=pixel.df$ratio))
+```
+
+A decrease in VV together with not so much decrease in VH might point to flooding with intact vegetation. More information on the plant appearance is needed.
+
+## Time Series for *all* (a Number of) Pixels
+Giving the opportunity of constructing very different results. Depending on whether neighboring pixels or random pixels are selected, similarities and differences are seen.
+```{r}
+# make first attribute, pixel 10/10 into dataframe template
+pix.df <- as.data.frame(comb_split[1,100,100,])[,3:4]
+# make data frame for all pixels
+for (i in 1:120) {
+  for (j in 1:119) {
+    if (is.na(comb_split[1,i,j,1][[1]])) {
+    }
+    else {
+      pix.df <- cbind(pix.df, as.vector(comb_split[1,i,j,][[1]]))
+    }
+  }
+}
+# delete template data frame column
+pix.df <- pix.df[,c(1,3:9264)]
+# assign numbers as names
+names(pix.df) <- c("time", seq(1,9262,1))
+```
+
+Here we have the possibility to select which pixels are plotted. For example each 37th pixel in the dataframe:
+
+```{r, warning=FALSE}
+# initiate plot
+p <- ggplot(data=pix.df, aes(x=pix.df$time)) + ylab("VV")
+# make sequence of pixel positions to plot
+ind <- seq(2,9263, 67)
+# loop
+for (i in ind) { p <- p + geom_line(aes_string(y = pix.df[,i]), alpha = 0.2) }
+p
+```
+
+or the first X columns, meaning a profile through the image:
+
+```{r, warning=FALSE}
+p <- ggplot(data=pix.df, aes(x=pix.df$time)) + ylab("VV")
+ind <- seq(2,60, 1)
+for (i in ind) { p <- p + geom_line(aes_string(y = pix.df[,i]), alpha=0.3) }
+p
+```
+
+## Using Ratio to Estimate How Similar VV and VH Are
+Instead of making a dataframe containing VV backscatter for each timestep, a VV/VH ratio is calculated per pixel, per timestep.
+
+```{r, echo=FALSE, warning=FALSE}
+# make first attribute, pixel 10/10 into dataframe template
+pix.df <- as.data.frame(comb_split[1,100,100,])[,3:4]
+# make data frame for all pixels
+for (i in 1:120) {
+  for (j in 1:119) {
+    if (is.na(comb_split[1,i,j,1][[1]])) {  }
+    else {
+      # pix.df <- cbind(pix.df, as.vector(comb_split[1,i,j,][[1]]))
+      rat <- as.vector(comb_split[1,i,j,][[1]]) / as.vector(comb_split[2,i,j,][[1]])
+      pix.df <- cbind(pix.df, rat)
+    }
+  }
+}
+# delete template data frame column
+pix.df <- pix.df[,c(1,3:9264)]
+# assign numbers as names
+names(pix.df) <- c("time", seq(1,9262,1))
+# initiate plot
+p <- ggplot(data=pix.df, aes(x=pix.df$time)) + xlab("time") + ylab("VV/VH ratio")
+# make sequence of pixel positions to plot
+ind <- seq(2,9363, 237)
+# loop
+for (i in ind) {
+  # use aes_string with names of the data.frame
+  # p <- p + geom_line(aes_string(y = pix.df[,i])) }
+  p <- p + geom_line(aes_string(y = pix.df[,i]), alpha = 0.2)
+}
+# plot
+p
+```
+
+VV and VH seem to grow more similar during the course of the year. Surprising unison in first less and then more similarity is exhibited around the start of april.
+
+## Plotting Standard Deviation of VV and VH
+```{r, echo=FALSE}
+# aggregate over time, once with standard deviation, once with mean
+comb_appl_sd <- st_apply(comb_split, "time", sd, na.rm=TRUE)
+comb_appl_mean <- st_apply(comb_split, "time", mean, na.rm=TRUE)
+# make into dataframe
+comb.sd.df <- as.data.frame(comb_appl_sd)
+comb.mean.df <- as.data.frame(comb_appl_mean)
+
+ggplot() +
+  geom_line(aes(x = comb.mean.df$time, y = comb.mean.df$VV, color="VV")) +
+  geom_line(aes(x = comb.sd.df$time, y = comb.mean.df$VV + comb.sd.df$VV), linetype="dashed") +
+  geom_line(aes(x = comb.sd.df$time, y = comb.mean.df$VV - comb.sd.df$VV), linetype="dashed") +
+  geom_line(aes(x = comb.mean.df$time, y = comb.mean.df$VH, color="VH")) +
+  geom_line(aes(x = comb.sd.df$time, y = comb.mean.df$VH + comb.sd.df$VH), linetype="dashed") +
+  geom_line(aes(x = comb.sd.df$time, y = comb.mean.df$VH - comb.sd.df$VH), linetype="dashed") +
+  scale_color_manual(name="Polarization", values=c(VV="red", VH="blue")) +
+  ylab("dB") +
+  xlab("Time") +
+  geom_vline(xintercept = as.numeric(as.Date("2018-04-02")), linetype=3) +
+  geom_vline(xintercept = as.numeric(as.Date("2018-04-09")), linetype=4) +
+  geom_vline(xintercept = as.numeric(as.Date("2018-02-01")), linetype=3) +
+  geom_vline(xintercept = as.numeric(as.Date("2018-01-27")), linetype=4) +
+  geom_vline(xintercept = as.numeric(as.Date("2018-07-02")), linetype=4) +
+  geom_vline(xintercept = as.numeric(as.Date("2018-07-14")), linetype=4) +
+  geom_vline(xintercept = as.numeric(as.Date("2018-07-26")), linetype=4) +
+  geom_vline(xintercept = as.numeric(as.Date("2018-02-08")), linetype=1) +
+  labs(subtitle="dotted = S2, dashed = S1, line = both")
+
+```
+
+# Sentinel 2 data
+```{r}
+NDVI_0204 <- read_stars("./S2_data/NDVI_02042018_clip.tif")
+MDWI_3_8 <- read_stars("./S2_data/MDWI_3_8_02042018_clip.tif")
+MDWI_8_12 <- read_stars("./S2_data/MDWI_8_12_02042018_clip.tif")
+shape_NDVI <- st_transform(shape, crs=st_crs(NDVI_0204))
+NDVI_0204_clip <- st_as_stars(NDVI_0204[shape_NDVI[124,]])
+MDWI_3_8 <- st_as_stars(MDWI_3_8[shape_NDVI[124,]])
+MDWI_8_12 <- st_as_stars(MDWI_8_12[shape_NDVI[124,]])
+# plot(comb_split[1,,,9], main="VV 09.04.")
+# plot(NDVI_0204_clip, main="NDVI 02.04.")
+# plot(comb_split[2,,,9], main="VH 09.04.")
+```
+
+## Example 1: April
+```{r, fig.show="hold", out.width="50%"}
+plot(comb_split[1,,,9], main="VV 09.04.")
+plot(comb_split[2,,,9], main="VH 09.04.")
+```
+
+```{r, fig.show="hold", out.width="33%", echo=FALSE}
+# par(mar = c(4, 4, .1, .1))
+plot(NDVI_0204_clip, main="NDVI 02.04.")
+plot(MDWI_3_8, main="NDWI (water bodies) 02.04.")
+plot(MDWI_8_12, main="NDWI (plant water) 02.04.")
+```
+
+```{r, figures-side, fig.show="hold", out.width="50%", warning=FALSE, echo=FALSE, eval=FALSE}
+# spplot
+april_VV <- as(comb_split[1,,,9], "Raster")
+april_VH <- as(comb_split[2,,,9], "Raster")
+colo <- viridisLite::inferno(21)
+brk <- seq(-19,-9,0.5)
+spplot(april_VV, col.regions = colo, at = brk, maxpixels=ncell(april_VV), main="VV")
+spplot(april_VH, col.regions = colo, at = brk, maxpixels=ncell(april_VV), main="VH")
+```
+
+## Example 2: February
+```{r, fig.show="hold", out.width="33%"}
+# NDVI from 01.02.2018, S1 from 27.01.
+NDVI_0102 <- read_stars("./S2_data/NDVI_01022018_clip.tif")
+NDVI_0102_clip <- st_as_stars(NDVI_0102[shape_NDVI[124,]])
+plot(NDVI_0102_clip, main="NDVI 01.02.")
+plot(comb_split[1,,,3], main="VV 27.01.")
+plot(comb_split[2,,,3], main="VH 27.01.")
+```
+
+# Time Series
+## Example 1: July
+```{r}
+dates[16:18]
+```
+
+```{r, fig.show="hold", out.width="33%", echo=FALSE}
+plot(comb_split[1,,,16], main="VV 02.07.")
+plot(comb_split[1,,,17], main="VV 14.07.")
+plot(comb_split[1,,,18], main="VV 26.07.")
+plot(comb_split[2,,,16], main="VH 02.07.")
+plot(comb_split[2,,,17], main="VH 14.07.")
+plot(comb_split[2,,,18], main="VH 26.07.")
+```
+
+### Normalized Change Ratio
+```{r, fig.show="hold", out.width="50%", echo=FALSE, warning=FALSE}
+cd1 <- (comb_split[1,,,16] - comb_split[1,,,17]) / (comb_split[1,,,16] + comb_split[1,,,17])
+cd2 <- (comb_split[2,,,16] - comb_split[2,,,17]) / (comb_split[2,,,16] + comb_split[2,,,17])
+cd3 <- (comb_split[1,,,17] - comb_split[1,,,18]) / (comb_split[1,,,17] + comb_split[1,,,18])
+cd4 <- (comb_split[2,,,17] - comb_split[2,,,18]) / (comb_split[2,,,17] + comb_split[2,,,18])
+# plot(cd1, main="Change 1-2, VV")
+# plot(cd2, main="Change 1-2, VH")
+# plot(cd3, main="Change 2-3, VV")
+# plot(cd4, main="Change 2-3, VH")
+cd1 <- as(cd1, "Raster")
+cd2 <- as(cd2, "Raster")
+cd3 <- as(cd3, "Raster")
+cd4 <- as(cd4, "Raster")
+colo <- viridisLite::inferno(28)
+brk <- seq(-0.14,0.14,0.01)
+spplot(cd1, col.regions = colo, at = brk, maxpixels=ncell(cd1), main="CD1 VV")
+spplot(cd2, col.regions = colo, at = brk, maxpixels=ncell(cd2), main="CD1 VH")
+spplot(cd3, col.regions = colo, at = brk, maxpixels=ncell(cd3), main="CD2 VV")
+spplot(cd4, col.regions = colo, at = brk, maxpixels=ncell(cd4), main="CD2 VH")
+```
+
+### Normalized Difference VV and VH
+```{r, fig.show="hold", out.width="33%", echo=FALSE, warning=FALSE}
+diff1 <- (comb_split[1,,,16] - comb_split[2,,,16]) / (comb_split[1,,,16] + comb_split[2,,,16])
+diff2 <- (comb_split[1,,,17] - comb_split[2,,,17]) / (comb_split[1,,,17] + comb_split[2,,,17])
+diff3 <- (comb_split[1,,,18] - comb_split[2,,,18]) / (comb_split[1,,,18] + comb_split[2,,,18])
+# plot(diff1, main="02.07.")
+# plot(diff2, main="14.07.")
+# plot(diff3, main="26.07.")
+diff1 <- as(diff1, "Raster")
+diff2 <- as(diff2, "Raster")
+diff3 <- as(diff3, "Raster")
+colo <- viridisLite::inferno(20)
+brk <- seq(-0.3,0.1,0.02)
+spplot(diff1, col.regions = colo, at = brk, maxpixels=ncell(diff1), main="Normalized Pol Difference 02.07.")
+spplot(diff2, col.regions = colo, at = brk, maxpixels=ncell(diff2), main="Normalized Pol Difference 14.07.")
+spplot(diff3, col.regions = colo, at = brk, maxpixels=ncell(diff3), main="Normalized Pol Difference 26.07.")
+```
+
+Sentinel Playground screenshot (NDWI - plant moisture) in clarification of the dark spot in the middle left part of the polygon. NDVI shows slightly less Vegetation. Visual shows a slightly brighter patch. -> not water.
+![sentinel playground screenshot - 16.07. / MDWI from bands 8A and 11](./S2_data/playground_16_07_2018_MDWI_8A11.png)
+
+
+## Example 2: February
+
+```{r, fig.show="hold", out.width="50%", echo=FALSE, warning=FALSE}
+plot(comb_split[1,,,3], main="VV 27.01.")
+plot(comb_split[2,,,3], main="VH 27.01.")
+plot(comb_split[1,,,4], main="VV 08.02.")
+plot(comb_split[2,,,4], main="VH 08.02.")
+NDVI_0102 <- read_stars("./S2_data/NDVI_01022018_clip.tif")
+NDVI_0802 <- read_stars("./S2_data/NDVI_08022018_clip.tif")
+shape_NDVI <- st_transform(shape, crs=st_crs(NDVI_0102))
+shape_NDVI2 <- st_transform(shape, crs=st_crs(NDVI_0802))
+NDVI_0102_clip <- st_as_stars(NDVI_0102[shape_NDVI[124,]])
+NDVI_0802_clip <- st_as_stars(NDVI_0802[shape_NDVI2[124,]])
+plot(NDVI_0102_clip, main="NDVI 01.02.")
+plot(NDVI_0802_clip, main="NDVI 08.02.")
+```
+
+### Normalized Change Ratio
+```{r, fig.show="hold", out.width="50%", echo=FALSE, warning=FALSE}
+cd1 <- (comb_split[1,,,3] - comb_split[1,,,4]) / (comb_split[1,,,3] + comb_split[1,,,4])
+cd2 <- (comb_split[2,,,3] - comb_split[2,,,4]) / (comb_split[2,,,3] + comb_split[2,,,4])
+cd1 <- as(cd1, "Raster")
+cd2 <- as(cd2, "Raster")
+colo <- viridisLite::inferno(60)
+brk <- seq(-0.3,0.3,0.01)
+spplot(cd1, col.regions = colo, at = brk, maxpixels=ncell(cd1), main="CD1 VV")
+spplot(cd2, col.regions = colo, at = brk, maxpixels=ncell(cd2), main="CD1 VH")
+```
+
+

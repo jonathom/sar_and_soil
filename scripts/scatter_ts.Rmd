@@ -1,0 +1,286 @@
+---
+title: "scatter_ts"
+author: "Jonathan Bahlmann"
+date: "10/8/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading
+Set wd and load packages.
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+```
+
+## Load data
+Intensity and rain data is handled here.
+```{r, echo=FALSE}
+# load files as proxy
+int_VV <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH <- read_stars("VH_clip.tif", proxy=TRUE)
+# rain must be an aggregated dataset with 31 timesteps
+rain <- readRDS("rain_warped_3daysum.rds")
+# assign names
+names(int_VV) <- "VV"
+names(int_VH) <- "VH"
+# transform shape into crs of intensity dataset
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV))
+# monitoring shapes
+moni <- read_sf("moni_shap.shp")
+water <- read_sf("water.shp")
+```
+
+## As stars, Assign date dimension
+Set polygonID. Data is clipped accordingly
+```{r}
+dates <- c(ymd("2018-01-03"), ymd("2018-01-15"), ymd("2018-01-27"), ymd("2018-02-08"), ymd("2018-02-20"), ymd("2018-03-04"), ymd("2018-03-16"), ymd("2018-03-28"), ymd("2018-04-09"), ymd("2018-04-21"), ymd("2018-05-03"), ymd("2018-05-15"), ymd("2018-05-27"), ymd("2018-06-08"), ymd("2018-06-20"), ymd("2018-07-02"), ymd("2018-07-14"), ymd("2018-07-26"), ymd("2018-08-07"), ymd("2018-08-19"), ymd("2018-08-31"), ymd("2018-09-12"), ymd("2018-09-24"), ymd("2018-10-06"), ymd("2018-10-18"), ymd("2018-10-30"), ymd("2018-11-11"), ymd("2018-11-23"), ymd("2018-12-05"), ymd("2018-12-17"), ymd("2018-12-29"))
+
+loadPolygon <- function(shape) {
+# This polygon is being looked at: polyID
+int_vv <- st_as_stars(int_VV[shape])
+int_vh <- st_as_stars(int_VH[shape])
+int_vv <- st_set_dimensions(int_vv, 3, val = dates, names = "time")
+int_vh <- st_set_dimensions(int_vh, 3, val = dates, names = "time")
+# c()
+comb <- c(int_vv, int_vh, along="bands")
+# switch bands to attributes, this is more of a design choice.
+comb_split <- split(comb, "bands")
+names(comb_split) <- c("VV", "VH")
+return(comb_split)
+}
+
+comb_split10 <- loadPolygon(water[10,])
+```
+
+## plot rain of complete AOA
+```{r, echo=FALSE, eval=FALSE}
+rain_all <- read_stars("rain_clip.tif")
+all_days <- seq(as.Date("2018-01-01"), as.Date("2018-12-31"), by="days")
+study_area_rain <- st_transform(study_area, crs=st_crs(rain_all))
+# rain_all <- rain_all[shape_rain]
+rain_all <- st_set_dimensions(rain_all, 3, values = all_days, names = "time")
+# cut
+rain_all <- rain_all[study_area_rain[3,]]
+rain.all.df <- as.data.frame(st_apply(rain_all, "time", mean, na.rm = TRUE))
+df <- rain.all.df[1:30,]
+ggplot(df, aes(x = time, y = mean)) +
+  geom_bar(stat='identity')# +
+ #  geom_vline(xintercept = as.numeric(as.Date("2018-02-20")), linetype=3) +
+#   geom_vline(xintercept = as.numeric(as.Date("2018-03-04")), linetype=3) +
+#   geom_vline(xintercept = as.numeric(as.Date("2018-03-16")), linetype=3)
+
+
+```
+
+## Plotting
+```{r}
+# whole year, both pols
+# VV
+plot(comb_split10[1,,,])
+# VH
+plot(comb_split10[2,,,])
+```
+
+Function to plot a normalized change ratio.
+
+```{r, echo=FALSE, warning=FALSE}
+plotCD <- function(starsObj, Attr, start, end) {
+  end <- end - 1
+  colo <- viridisLite::inferno(60)
+  brk <- seq(-0.3,0.3,0.01)
+  for (i in start:end) {
+    cd <- (starsObj[Attr,,,i] - starsObj[Attr,,,i+1]) / (starsObj[Attr,,,i] + starsObj[Attr,,,i+1])
+    title <- paste0("Norm. Change Ratio ", dates[i], " to ", dates[i+1])
+    image(cd, col = colo, breaks = brk, main = title) # maxpixels=ncell(cd), main=title)
+  }
+}
+```
+
+```{r, fig.show="hold", out.width="25%", warning=FALSE}
+# VV, from 1 to 31
+plotCD(comb_split10, 1, 1, 5)
+```
+
+Function to plot a timeseries of pixel for a certain polygon
+```{r, echo=FALSE, warning=FALSE}
+ploTShape <- function(starsObj, polygon, polygon2 = NULL) {
+# initiate
+pix.df.tmp <- as.data.frame(comb_split10[1,18,18,])[,3:4]
+pix.df <- pix.df.tmp
+pix.df.2 <- pix.df.tmp
+# clip
+ext <- starsObj[polygon]
+# make data frame for all pixels
+for (i in 1:nrow(ext)) {
+  for (j in 1:ncol(ext)) {
+    if (is.na(ext[1,i,j,1][[1]])) {
+    }
+    else {
+      pix.df <- cbind(pix.df, as.vector(ext[1,i,j,][[1]]))
+    }
+  }
+}
+
+if(!is.null(polygon2)) {
+  ext2 <- starsObj[polygon2]
+  # make data frame for all pixels
+  for (i in 1:nrow(ext2)) {
+    for (j in 1:ncol(ext2)) {
+      if (is.na(ext2[1,i,j,1][[1]])) {
+      }
+      else {
+        pix.df.2 <- cbind(pix.df.2, as.vector(ext2[1,i,j,][[1]])) 
+      }
+    }
+  }
+  pix.df.2 <- pix.df.2[,c(1,3:ncol(pix.df.2))]
+  f <- ncol(pix.df.2) - 1
+  names(pix.df.2) <- c("time", seq(1,f,1))
+}
+else {}
+
+# delete template data frame column
+# pix.df <- pix.df[,c(1,3:ncol(pix.df))]
+# assign numbers as names
+f <- ncol(pix.df) - 2
+names(pix.df) <- c("time", "prec", seq(1,f,1))
+
+  # initiate plot
+  p <- ggplot(data=pix.df, aes(x=pix.df$time))
+    # ylab("Precipitation") + 
+    # geom_bar(aes(y=pix.df$prec), stat='identity') +
+    # scale_y_continuous(sec.axis = sec_axis(~. + 22, name = "Intensity + 22"))
+  
+  # make sequence of pixel positions to plot
+  ind <- seq(3,ncol(pix.df), 7)
+  # loop
+  for (i in ind) { p <- p + geom_line(aes_string(y = pix.df[,i]), alpha = 0.2) }
+  if(!is.null(polygon2)) {
+      inde <- seq(2, ncol(pix.df.2), 7)
+      for (j in inde) { p <- p + geom_line(aes_string(y = pix.df.2[,j]), alpha = 0.1, color="red") }
+  } else{}
+
+  p
+}
+```
+
+#### Compare Two Suspected Water Patches
+```{r, warning=FALSE}
+# both are thesis: water
+ploTShape(comb_split10, moni[8,], moni[11,])
+```
+
+#### Water (black) and "Random" Field (red)
+```{r, warning=FALSE}
+ploTShape(comb_split10, moni[10,], moni[9,])
+```
+
+#### Water (black) and other field (red)
+```{r, warning=FALSE}
+# ploTShape(comb_split10, moni[4,], moni[6,])
+```
+
+#### polygon - water shape and water shape itself
+```{r, warning=FALSE}
+plotbox <- function(starsObj, date, polygon1, polygon2) {
+  poly1 <- starsObj[polygon1]
+  poly2 <- starsObj[polygon2]
+  poly1.df <- as.data.frame(poly1[,,,date])
+  poly1.df$cat <- "polygon 1"
+  poly2.df <- as.data.frame(poly2[,,,date])
+  poly2.df$cat <- "polygon 2"
+  poly <- rbind(poly1.df, poly2.df)
+  ggplot(poly, aes(x=poly$cat, y=poly$VV)) + geom_boxplot()
+}
+
+plotbox(comb_split10, 1, moni[2,], shape[124,])
+# plotbox(comb_split10, 3, moni[2,], shape[124,])
+# plotbox(comb_split10, 6, moni[2,], shape[124,])
+```
+
+```{r, fig.show="hold", out.width="33%", warning=FALSE}
+plotthree <- function(obj, start, end) {
+colo = viridisLite::inferno(85)
+breaks = seq(-25, -8, 0.2)
+threshold = -15
+
+for (i in start:end) {
+  plot(obj[1,,,i])
+  image(obj[1,,,i], col = colo, breaks = breaks)
+  image(obj[1,,,i], col = c("white", "black"), breaks = c(-22, threshold, 0))
+}
+}
+
+# plotthree(comb_split10, 1, 7)
+```
+
+## Look at step 6 of other polygons
+```{r, fig.show="hold", out.width="50%", warning=FALSE}
+comb_split124 <- loadPolygon(moni[8,])
+# VV
+plotCD(comb_split10, 1, 9, 11)
+```
+```{r, fig.show="hold", out.width="50%", warning=FALSE}
+# VH
+plotCD(comb_split10, 2, 9, 11)
+```
+```{r, fig.show="hold", out.width="33%", warning=FALSE}
+# plots: stars-plot, stars-image with unified scale, masked image
+plotthree(comb_split10, 1, 31)
+```
+
+```{r, fig.show="hold", out.width="50%", warning=FALSE}
+comb_split123 <- loadPolygon(moni[9,])
+# VV
+plotCD(comb_split123, 1, 9, 11)
+```
+```{r, fig.show="hold", out.width="50%", warning=FALSE}
+# VH
+plotCD(comb_split123, 2, 9, 11)
+```
+```{r, fig.show="hold", out.width="33%", warning=FALSE}
+# plots: stars-plot, stars-image with unified scale, masked image
+plotthree(comb_split123, 9, 11)
+```
+
+```{r, fig.show="hold", out.width="50%", warning=FALSE}
+comb_split112 <- loadPolygon(moni[10,])
+# VV
+plotCD(comb_split112, 1, 9, 11)
+```
+```{r, fig.show="hold", out.width="50%", warning=FALSE}
+# VH
+plotCD(comb_split112, 2, 9, 11)
+```
+```{r, fig.show="hold", out.width="33%", warning=FALSE}
+# plots: stars-plot, stars-image with unified scale, masked image
+plotthree(comb_split112, 9, 11)
+```
+
+```{r, fig.show="hold", out.width="50%", warning=FALSE}
+comb_split108 <- loadPolygon(moni[11,])
+# VV
+plotCD(comb_split108, 1, 9, 11)
+```
+```{r, fig.show="hold", out.width="50%", warning=FALSE}
+# VH
+plotCD(comb_split108, 2, 9, 11)
+```
+```{r, fig.show="hold", out.width="33%", warning=FALSE}
+# plots: stars-plot, stars-image with unified scale, masked image
+plotthree(comb_split108, 9, 11)
+```
+

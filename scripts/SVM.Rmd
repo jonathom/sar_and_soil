@@ -1,0 +1,505 @@
+---
+title: "SVM"
+author: "Jonathan Bahlmann"
+date: "10/12/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+library(e1071)
+```
+
+## Load data
+Intensity and rain data is handled here.
+```{r, echo=FALSE}
+# load files as proxy
+int_VV <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH <- read_stars("VH_clip.tif", proxy=TRUE)
+# assign names
+names(int_VV) <- "VV"
+names(int_VH) <- "VH"
+# monitoring waters
+water_shape <- read_sf("water.shp")
+# study area
+study_area <- read_sf("study_area.shp")
+# shape
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV))
+# moni
+moni <- read_sf("moni_shap.shp")
+# double bounce
+db <- read_sf("double_bounce.shp")
+```
+
+## Load Rain Data
+Rain is cut to the narrow area surrounding the wetlands as plotted in the time series.
+
+```{r, echo=FALSE}
+rain_all <- read_stars("rain_clip.tif")
+all_days <- seq(as.Date("2018-01-01"), as.Date("2018-12-31"), by="days")
+study_area_rain <- st_transform(study_area, crs=st_crs(rain_all))
+# rain_all <- rain_all[shape_rain]
+rain_all <- st_set_dimensions(rain_all, 3, values = all_days, names = "time")
+# cut
+rain_all <- rain_all[study_area_rain[1,]]
+rain.all.df <- as.data.frame(st_apply(rain_all, "time", mean, na.rm = TRUE))
+```
+
+## As stars, Assign date dimension
+Set polygonID. Data is clipped accordingly
+```{r, echo=FALSE}
+dates <- c(ymd("2018-01-03"), ymd("2018-01-15"), ymd("2018-01-27"), ymd("2018-02-08"), ymd("2018-02-20"), ymd("2018-03-04"), ymd("2018-03-16"), ymd("2018-03-28"), ymd("2018-04-09"), ymd("2018-04-21"), ymd("2018-05-03"), ymd("2018-05-15"), ymd("2018-05-27"), ymd("2018-06-08"), ymd("2018-06-20"), ymd("2018-07-02"), ymd("2018-07-14"), ymd("2018-07-26"), ymd("2018-08-07"), ymd("2018-08-19"), ymd("2018-08-31"), ymd("2018-09-12"), ymd("2018-09-24"), ymd("2018-10-06"), ymd("2018-10-18"), ymd("2018-10-30"), ymd("2018-11-11"), ymd("2018-11-23"), ymd("2018-12-05"), ymd("2018-12-17"), ymd("2018-12-29"))
+
+loadPolygon <- function(shape) {
+# This polygon is being looked at: polyID
+int_vv <- st_as_stars(int_VV[shape])
+int_vh <- st_as_stars(int_VH[shape])
+int_vv <- st_set_dimensions(int_vv, 3, val = dates, names = "time")
+int_vh <- st_set_dimensions(int_vh, 3, val = dates, names = "time")
+# c()
+comb <- c(int_vv, int_vh, along="bands")
+# switch bands to attributes, this is more of a design choice.
+comb_split <- split(comb, "bands")
+names(comb_split) <- c("VV", "VH")
+return(comb_split)
+}
+
+# shape; timesteps is a vector of numbers e.g. c(1:3)
+lazyLoadPolygon <- function(shape, timesteps) {
+  int_vv <- int_VV[1,,,timesteps]
+  int_vh <- int_VH[1,,,timesteps]
+  int_vv <- st_as_stars(int_vv[shape])
+  int_vh <- st_as_stars(int_vh[shape])
+  int_vv <- st_set_dimensions(int_vv, 3, val = dates[timesteps], names = "time")
+  int_vh <- st_set_dimensions(int_vh, 3, val = dates[timesteps], names = "time")
+  # c()
+  comb <- c(int_vv, int_vh, along="bands")
+  # switch bands to attributes, this is more of a design choice.
+  comb_split <- split(comb, "bands")
+  names(comb_split) <- c("VV", "VH")
+  return(comb_split)
+}
+```
+
+### Load reference stars objects
+```{r}
+all <- loadPolygon(study_area[1,])
+# don't know why but can only give vector here
+# all_bigger <- loadPolygon(study_area[2,])
+# lose the extra dimension
+# all_bigger <- all_bigger[,,,1]
+```
+
+## Create DF with VV measures & classes
+```{r}
+end <- length(water_shape$type)
+for (k in 1:end) {
+  if(water_shape[k,]$type != "mixed") {
+    poly <- loadPolygon(water_shape[k,])
+    # set VV, timestep
+    poly <- poly[1,,,1]
+    poly.df <- as.data.frame(poly)
+    poly.df$type <- water_shape[k,]$type
+    poly.df <- poly.df[complete.cases(poly.df),]
+    if(k == 1) {
+      val <- poly.df[,4:5]
+    }
+    else {
+      val <- rbind(val, poly.df[,4:5])
+    }
+  }
+}
+# boxplot
+ggplot(val, aes(x=type, y=VV)) +
+  geom_boxplot() +
+  geom_hline(yintercept = -15.34187)
+```
+
+```{r, echo=FALSE}
+# function
+findThreshold <- function(df) {
+  # find median of surface types
+  medians <- aggregate(VV ~ type, val, median)
+  means <- aggregate(VV ~ type, val, mean)
+  # sort, must be ascending, VV - type
+  val <- val[order(val$VV),]
+  # result df
+  thr.ma <- matrix(c(NA,NA,NA,NA), ncol=4)
+  # go through val
+  end <- nrow(df) - 1
+  for (i in 1:end) {
+    lower <- df[i,1]
+    upper <- df[i+1,1]
+    
+    thresh <- lower + ((abs(lower) - abs(upper)) / 2 )
+    
+    err1 <- 0
+    err2 <- 0
+    
+    for (j in 1:nrow(df)) {
+      if(df[j,2] == "water") {
+        if(df[j,1] < thresh) {
+          # contr <- contr + 1 # correct
+        }
+        else {
+          err1 <- err1 + 1
+        }
+      }
+      if(df[j,2] != "water") {
+        if(df[j,1] > thresh) {
+          # contr <- contr + 1 # correct
+        }
+        else {
+          err2 <- err2 + 1
+        }
+      }
+    }
+    # write result
+    thr.ma <- rbind(thr.ma, c(thresh, err1+err2, err1, err2))
+  }
+  thr.df <- as.data.frame(thr.ma)
+  names(thr.df) <- c("Threshold", "Error", "Err1", "Err2")
+  thr.df <- thr.df[order(thr.df$Error),]
+  # Accuracies
+  overall <- table(unlist(val$type))
+  # fie <- overall[1]
+  # wat <- overall[2]
+  # prod_fie <- (fie - thr.df[1,4]) / fie * 100
+  # prod_wat <- (wat - thr.df[1,3]) / wat * 100
+  # user_fie <- (fie - thr.df[1,4]) / (thr.df[1,3] + fie - thr.df[1,4]) * 100
+  # user_wat <- (wat - thr.df[1,3]) / (thr.df[1,4] + wat - thr.df[1,3]) * 100
+  
+  res <- list("threshold" = thr.df[1,1], "errors" = thr.df[1,2], 
+              #"Prod. Accuracy Water" = prod_wat, "Prod. Accuracy Field" = prod_fie, "Users Acc. Water" = user_wat, "Users Acc. Field" = user_fie, 
+              "Medians" = medians, "Means" = means)
+  return(res)
+  # return(thr.df[1,1])
+  # return(thr.df)
+}
+```
+
+## Implement SVM-like Algorithm and calculate Threshold
+```{r}
+# thresh <- findThreshold(val)
+thresh <- list("threshold" = -14.77885)
+thresh
+```
+
+## Plot AOI with calculated Threshold
+```{r, fig.show="hold", out.width="50%"}
+# plot overall region
+image(all[1,,,1], col = c("white", "black", "green"), breaks = c(-30, thresh$threshold, -8.833493, 20))
+```
+
+## Export as Raster
+```{r, warning=FALSE, echo=FALSE}
+obj <- all[1,,,1]
+obj <- as(obj, "Raster")
+obj[obj < thresh$threshold] <- NA
+obj[obj >= thresh$threshold] <- 1
+# plot(obj)
+writeRaster(obj, "test_water_det.tif", overwrite=TRUE)
+```
+
+```{r, echo=FALSE}
+# time series
+plotTS <- function(obj, threshold, threshold2, start, end) {
+colo = viridisLite::inferno(85)
+breaks = seq(-25, -8, 0.2)
+
+jahresniederschlag = sum(rain.all.df$mean)
+durchschnitt = jahresniederschlag / 365
+
+for (i in start:end) {
+  # + 4 and + 12 can be set to + 3 and + 11 to slightly change interval
+  start.rain <- (i - 1) * 12 + 4
+  end.rain <- start.rain + 12
+  df <- rain.all.df[start.rain:end.rain,]
+  gesamt <- floor((sum(df$mean)) * 100) / 100
+  percent <- (floor((gesamt * 100 / jahresniederschlag) * 100)) / 100
+  titl = paste0(df[1,1], " until ", df[nrow(df),1], " // ", gesamt, "mm or ", percent, "% of all rain")
+  print(ggplot(df, aes(x = time, y = mean)) +
+    geom_bar(stat='identity') + ylab("Precipitation") + xlab("Time") +
+    ggtitle(titl) + theme(plot.title = element_text(size = 20)))
+  image(obj[1,,,i], col = colo, breaks = breaks, main = dates[i])
+  image(obj[1,,,i], col = c("white", "black", "green"), breaks = c(-35, threshold, threshold2, 35), main = dates[i])
+}
+}
+```
+
+## Time Series: Rain, Scaled Plot and Threshold
+Rain is summed up over the plotted area. Absolute values are given in mm and relative values are given in respect to the yearly sum.
+
+```{r, fig.show="hold", out.width="33%"}
+plotTS(all, thresh$threshold, -8.833493, 1, 31)
+```
+
+## Plots
+```{r, echo=FALSE, eval=FALSE}
+for (i in 1:31) {
+  scene <- all_bigger[1,,,i]
+  # order is important
+  scene[scene >= thresh$threshold] <- 1
+  scene[scene < thresh$threshold] <- 0
+  if(i == 1) {
+    class.sum <- scene
+  }
+  else {
+    class.sum <- class.sum + scene
+  }
+}
+```
+
+```{r, eval=FALSE, fig.show="hold", out.width="50%"}
+colo = viridisLite::inferno(31)
+breaks = seq(0, 31, 1)
+image(class.sum, col = colo, breaks = breaks)
+image(class.sum[study_area[1,]], col = colo, breaks = breaks)
+```
+
+```{r, eval=FALSE, fig.show="hold", out.width="50%"}
+plot(class.sum[moni[12,]])
+plot(class.sum[shape[124,]])
+```
+
+## SVM
+Prepare new data without street class..
+
+```{r, echo=FALSE, warning=FALSE}
+# prepare new data, WITHOUT STREET
+end <- length(water_shape$type)
+for (k in 1:end) {
+  if(water_shape[k,]$type != "mixed" && water_shape[k,]$type != "street") {
+    poly <- loadPolygon(water_shape[k,])
+    # set VV, timestep
+    poly <- poly[1,,,1]
+    poly.df <- as.data.frame(poly)
+    poly.df$type <- water_shape[k,]$type
+    poly.df <- poly.df[complete.cases(poly.df),]
+    if(k == 1) {
+      val.svm <- poly.df[,4:5]
+    }
+    else {
+      val.svm <- rbind(val.svm, poly.df[,4:5])
+    }
+  }
+}
+```
+
+```{r, warning=FALSE}
+# prepare data
+val.svm$type <- as.factor(val.svm$type)
+attach(val.svm)
+x <- subset(val.svm, select=-type)
+y <- type
+# make model
+svmmod <- svm(x,y)
+summary(svmmod)
+# make prediction, confusion matrix
+pred <- predict(svmmod,x)
+table(pred, y)
+```
+
+```{r, echo=FALSE}
+# tune
+# svm_tune <- tune(svm, train.x=x, train.y=y, kernel="radial", ranges=list(cost=10^(-1:2), gamma=c(.5,1,2)))
+# print(svm_tune)
+# svm_model_after_tune <- svm(type ~ ., data=val.svm, kernel="radial", cost=1, gamma=1)
+# summary(svm_model_after_tune)
+```
+
+```{r, fig.show="hold", out.width="50%"}
+# threshold is
+svmmod$x.scale$`scaled:center`
+# plot classified with threshold calculated by SVM
+plot(all[1,,,1], col = c("white", "black"), breaks = c(-35, svmmod$x.scale$`scaled:center`, 10))
+# vs old threshold
+# plot(all[1,,,1], col = c("white", "black"), breaks = c(-35, thresh$threshold, 10))
+```
+
+It appears that SVM finds a significant lower threshold than the amateur 'SVM - like' implementation (simple "best class separation"). That is while not giving the SVM the "street" - training data, because that data would be treated as an own class in SVM, which it wasn't in the class-separation approach, where it was only regarded as "non-water" data points.
+
+## Comparison Class-Separation Threshold (left) and SVM (right)
+```{r, echo=FALSE, eval=FALSE}
+for (i in 1:31) {
+  scene <- all_bigger[1,,,i]
+  # order is important
+  scene[scene >= svmmod$x.scale$`scaled:center`] <- 1
+  scene[scene < svmmod$x.scale$`scaled:center`] <- 0
+  if(i == 1) {
+    class.sum.svm <- scene
+  }
+  else {
+    class.sum.svm <- class.sum.svm + scene
+  }
+}
+```
+
+```{r, eval=FALSE, fig.show="hold", out.width="50%"}
+colo = viridisLite::inferno(31)
+breaks = seq(0, 31, 1)
+
+image(class.sum, col = colo, breaks = breaks)
+image(class.sum.svm, col = colo, breaks = breaks)
+
+image(class.sum[study_area[1,]], col = colo, breaks = breaks)
+image(class.sum.svm[study_area[1,]], col = colo, breaks = breaks)
+
+plot(class.sum[moni[12,]])
+plot(class.sum.svm[moni[12,]])
+
+plot(class.sum[shape[124,]])
+plot(class.sum.svm[shape[124,]])
+```
+
+## Create Sum for Larger Area
+```{r, warning=FALSE, eval=FALSE}
+# set Threshold -15.34187
+threshold <- svmmod$x.scale$`scaled:center`
+# load as shape
+ext <- study_area[3,]
+# bbox can be used for stars subsetting []
+ext <- st_bbox(ext) # ext is xmin ymin xmax ymax
+# study area one has 11860, 10.000 seems OK tile size
+# calculate span
+x.span <- ext[3] - ext[1] # X
+y.span <- ext[4] - ext[2] # Y
+# calc good number of cuts
+x.cuts <- ceiling(x.span / 10000)
+y.cuts <- ceiling(y.span / 10000)
+# calc cut length
+x.cut.by <- x.span / x.cuts
+y.cut.by <- y.span / y.cuts
+
+# tile counter
+count <- 0
+# go through all cuts in X direction
+for (i in 1:x.cuts) {
+  # go through all cuts in Y direction
+  for (j in 1:y.cuts) {
+    count <- count + 1
+    # make extent object
+    xmin <- ext[1] + (i - 1) * x.cut.by
+    xmax <- ext[1] + i * x.cut.by
+    ymin <- ext[2] + (j - 1) * y.cut.by
+    ymax <- ext[2] + j * y.cut.by
+    
+    cutbox <- ext
+    cutbox[1] <- xmin
+    cutbox[2] <- ymin
+    cutbox[3] <- xmax
+    cutbox[4] <- ymax
+    
+    # cutbox <- extent(xmin, ymin, xmax, ymax)
+    
+    # load stars
+    tile <- loadPolygon(cutbox)
+    
+    # create sum
+    for (k in 1:31) {
+      scene <- tile[1,,,k]
+      # order is important
+      scene[scene >= threshold] <- 1
+      scene[scene < threshold] <- 0
+      if(k == 1) {
+        class.sum.svm <- scene
+      }
+      else {
+        class.sum.svm <- class.sum.svm + scene
+      }
+    }
+    
+    # make name
+    if(count < 10) {
+      name <- paste0("./tiles/tile_0", count, ".tif")
+    } else {
+      name <- paste0("./tiles/tile_", count, ".tif")
+    }
+    # export
+    write_stars(class.sum.svm, name)
+
+  }
+}
+
+list <- list.files("./tiles")
+for (l in 1:length(list)) {
+  str <- paste0("./tiles/", list[l])
+  ras <- raster(str)
+  if(l < 2) {
+    allRas <- ras
+  }
+  else {
+    allRas <- raster::merge(allRas, ras)
+  }
+}
+writeRaster(allRas, "allRas.tif", overwrite=TRUE)
+```
+
+```{r}
+allRas <- raster("allRas.tif")
+plot(allRas)
+colo = viridisLite::inferno(31)
+breaks = seq(0, 31, 1)
+image(allRas, col = colo, breaks = breaks)
+```
+
+## Training of Double Bounce Class
+```{r}
+end <- length(db$type)
+for (k in 1:end) {
+  if(db[k,]$type != "mixed") {
+    poly <- loadPolygon(db[k,])
+    # set VV, timestep
+    poly <- poly[1,,,1]
+    poly.df <- as.data.frame(poly)
+    poly.df$type <- db[k,]$type
+    poly.df <- poly.df[complete.cases(poly.df),]
+    if(k == 1) {
+      val.db <- poly.df[,4:5]
+    }
+    else {
+      val.db <- rbind(val.db, poly.df[,4:5])
+    }
+  }
+}
+```
+
+### SVM DB Training
+```{r, warning=FALSE}
+# prepare data
+val.db$type <- as.factor(val.db$type)
+attach(val.db)
+x <- subset(val.db, select=-type)
+y <- type
+# make model
+svm.db <- svm(x,y)
+summary(svm.db)
+# make prediction, confusion matrix
+pred <- predict(svm.db,x)
+table(pred, y)
+```
+
+```{r, fig.show="hold", out.width="50%"}
+# threshold is
+svm.db$x.scale$`scaled:center`
+# boxplot
+ggplot(val.db, aes(x=type, y=VV)) +
+  geom_boxplot() +
+  geom_hline(yintercept = svm.db$x.scale$`scaled:center`)
+# plot classified with threshold calculated by SVM
+plot(all[1,,,1], col = c("white", "black"), breaks = c(-35, svm.db$x.scale$`scaled:center`, 20))
+```

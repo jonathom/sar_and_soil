@@ -1,0 +1,788 @@
+---
+title: "Connect Data from 2017 and 2018"
+author: "Jonathan Bahlmann"
+date: "10/19/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+library(e1071)
+```
+
+## Load data
+Intensity and shapefile data is handled here.
+```{r loading-data, echo=FALSE}
+# load files as proxy
+int_VV_2017 <- read_stars("VV_2017_clip.tif", proxy=TRUE)
+int_VH_2017 <- read_stars("VH_2017_clip.tif", proxy=TRUE)
+int_VV_2018 <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH_2018 <- read_stars("VH_clip.tif", proxy=TRUE)
+# assign names
+names(int_VV_2017) <- "VV"
+names(int_VH_2017) <- "VH"
+names(int_VV_2018) <- "VV"
+names(int_VH_2018) <- "VH"
+# monitoring waters
+water_shape_2017 <- read_sf("water (copy).shp")
+water_shape_2018 <- read_sf("water.shp")
+water_shape_2017_july07 <- read_sf("water_shape_intersec.shp")
+# study area
+study_area <- read_sf("study_area.shp")
+# shape
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV_2018))
+# moni
+moni <- read_sf("moni_shap.shp")
+# double bounce
+db <- read_sf("double_bounce.shp")
+
+# water_general <- water_shape_2017[lengths(st_intersects(water_shape_2017, water_shape_2018)) != 0,]
+```
+
+```{r make-dates}
+# make dates
+info = gdalinfo("VV_2017_clip.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+dates2017 <- as_date(descr)
+
+info = gdalinfo("VV_clip.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+dates2018 <- as_date(descr)
+```
+
+```{r load-polygon-func}
+# function takes a shape as an AOI and a year (2017 or 2018)
+loadPolygon <- function(shape, year) {
+  if(year == 2017) {
+    int_VV <- int_VV_2017
+    int_VH <- int_VH_2017
+    dates <- dates2017
+  } else {
+    if(year == 2018) {
+      int_VV <- int_VV_2018
+      int_VH <- int_VH_2018
+      dates <- dates2018
+    } else {
+      return("wrong year entered!")
+    }
+  }
+  int_vv <- st_as_stars(int_VV[shape])
+  int_vh <- st_as_stars(int_VH[shape])
+  int_vv <- st_set_dimensions(int_vv, 3, val = dates, names = "time")
+  int_vh <- st_set_dimensions(int_vh, 3, val = dates, names = "time")
+  # c()
+  comb <- c(int_vv, int_vh, along="bands")
+  # switch bands to attributes, this is more of a design choice.
+  comb_split <- split(comb, "bands")
+  names(comb_split) <- c("VV", "VH")
+  return(comb_split)
+}
+```
+
+## Combined Water Threshold Training
+
+### Detection Goal
+```{r}
+area1 <- loadPolygon(shape[124,], 2018)
+area2 <- loadPolygon(shape[124,], 2017)
+# this kind of water puddle:
+plot(area1[1,,,1])
+```
+
+### Make Data From Both Years
+Before, thresholds were calculates for single years, resulting in -15.3 for 2018 and about -18 for 2017. 
+```{r, echo=FALSE, warning=FALSE}
+waterfunc <- function(end, water_shape, index)    {    
+  for (k in 1:end) {
+    type <- water_shape[k,]$type
+    area <- water_shape[k,]$area
+    # select which classes should be included
+    if(type != "street" && !is.null(area) && (area == "field" || area == "lake")) {
+      poly <- loadPolygon(water_shape[k,], 2017)
+      # set VV, timestep
+      poly <- poly[1,,,index]
+      poly.df <- as.data.frame(poly)
+      #if(water_shape[k,]$type == "water") {
+      #  poly.df$type <- water_shape[k,]$type
+      #} else {
+      #  poly.df$type <- "other"
+      #}
+      poly.df$type <- water_shape[k,]$type
+      poly.df$sitch <- paste0(water_shape[k,]$type, " in ", water_shape[k,]$area)
+      poly.df <- poly.df[complete.cases(poly.df),]
+      if(k == 1) {
+        val.svm <- poly.df[,4:6]
+      } else {
+        val.svm <- rbind(val.svm, poly.df[,4:6])
+        }
+    }
+  }
+  return(val.svm)
+}
+
+val1 <- waterfunc(length(water_shape_2017$type), water_shape_2017, 1)
+val2 <- waterfunc(length(water_shape_2018$type), water_shape_2018, 1)
+val3 <- waterfunc(length(water_shape_2017_july07$type), water_shape_2017_july07, 15)
+
+val.svm <- rbind(val1, val2, val3)
+```
+
+```{r make-tr-data2, warning=FALSE, fig.show="hold", out.width="50%"}
+# prepare data
+val.svm$type <- as.factor(val.svm$type)
+attach(val.svm)
+x <- subset(val.svm, select=c(-type, -sitch))
+y <- type
+# make model
+svmmod <- svm(x,y)
+# summary(svmmod)
+# make prediction, confusion matrix
+pred <- predict(svmmod,x)
+table(pred, y)
+# threshold is
+svmmod$x.scale$`scaled:center`
+# plot classified with threshold calculated by SVM
+plot(area1[1,,,1], col = c("white", "black"), breaks = c(-35, svmmod$x.scale$`scaled:center`, 10))
+# vs old threshold
+# plot(all[1,,,1], col = c("white", "black"), breaks = c(-35, thresh$threshold, 10))
+ggplot(val.svm, aes(x=sitch, y=VV)) +
+  geom_boxplot() +
+  geom_hline(yintercept = svmmod$x.scale$`scaled:center`)
+```
+
+### Look at Training Data
+```{r, echo=FALSE, warning=FALSE}
+waterfunc <- function(end, water_shape, index)    {    
+  for (k in 1:end) {
+    type <- water_shape[k,]$type
+    area <- water_shape[k,]$area
+    # select which classes should be included
+    if(type != "street" && !is.null(area)) {
+      poly <- loadPolygon(water_shape[k,], 2017)
+      # set VV, timestep
+      poly <- poly[1,,,index]
+      poly.df <- as.data.frame(poly)
+      #if(water_shape[k,]$type == "water") {
+      #  poly.df$type <- water_shape[k,]$type
+      #} else {
+      #  poly.df$type <- "other"
+      #}
+      poly.df$type <- water_shape[k,]$type
+      poly.df$sitch <- paste0(water_shape[k,]$type, " in ", water_shape[k,]$area)
+      poly.df <- poly.df[complete.cases(poly.df),]
+      if(k == 1) {
+        val.svm <- poly.df[,4:6]
+      } else {
+        val.svm <- rbind(val.svm, poly.df[,4:6])
+        }
+    }
+  }
+  return(val.svm)
+}
+
+val1 <- waterfunc(length(water_shape_2017$type), water_shape_2017, 1)
+val2 <- waterfunc(length(water_shape_2018$type), water_shape_2018, 1)
+val3 <- waterfunc(length(water_shape_2017_july07$type), water_shape_2017_july07, 15)
+
+val.svm <- rbind(val1, val2, val3)
+```
+
+```{r make-tr-data3, echo=FALSE, warning=FALSE, fig.show="hold", out.width="50%"}
+# prepare data
+val.svm$type <- as.factor(val.svm$type)
+attach(val.svm)
+x <- subset(val.svm, select=c(-type, -sitch))
+y <- type
+# make model
+svmmod <- svm(x,y)
+# summary(svmmod)
+# make prediction, confusion matrix
+pred <- predict(svmmod,x)
+table(pred, y)
+# threshold is
+svmmod$x.scale$`scaled:center`
+# plot classified with threshold calculated by SVM
+plot(area1[1,,,1], col = c("white", "black"), breaks = c(-35, svmmod$x.scale$`scaled:center`, 10))
+# vs old threshold
+# plot(all[1,,,1], col = c("white", "black"), breaks = c(-35, thresh$threshold, 10))
+ggplot(val.svm, aes(x=sitch, y=VV)) +
+  geom_boxplot() +
+  geom_hline(yintercept = svmmod$x.scale$`scaled:center`)
+```
+
+## Create New Threshold - Sum Raster
+```{r make-2017-tiles, eval=FALSE, echo=FALSE, warning=FALSE}
+ext <- study_area[3,]
+folderName <- "minus17/tiles_2018"
+threshold <- -17.62537
+dates <- dates2018
+
+  # bbox can be used for stars subsetting []
+  ext <- st_bbox(ext) # ext is xmin ymin xmax ymax
+  # study area one has 11860, 10.000 seems OK tile size
+  # calculate span
+  x.span <- ext[3] - ext[1] # X
+  y.span <- ext[4] - ext[2] # Y
+  # calc good number of cuts
+  x.cuts <- ceiling(x.span / 10000)
+  y.cuts <- ceiling(y.span / 10000)
+  # calc cut length
+  x.cut.by <- x.span / x.cuts
+  y.cut.by <- y.span / y.cuts
+
+  # tile counter
+  count <- 0
+  # go through all cuts in X direction
+  for (i in 1:x.cuts) {
+    # go through all cuts in Y direction
+    for (j in 1:y.cuts) {
+      count <- count + 1
+      # make extent object
+      xmin <- ext[1] + (i - 1) * x.cut.by
+      xmax <- ext[1] + i * x.cut.by
+      ymin <- ext[2] + (j - 1) * y.cut.by
+      ymax <- ext[2] + j * y.cut.by
+      
+      cutbox <- ext
+      cutbox[1] <- xmin
+      cutbox[2] <- ymin
+      cutbox[3] <- xmax
+      cutbox[4] <- ymax
+      
+      # cutbox <- extent(xmin, ymin, xmax, ymax)
+      
+      # load stars  
+      tile <- loadPolygon(cutbox, 2018)
+    
+      # create sum
+      for (k in 1:length(dates2018)) {
+        scene <- tile[1,,,k]
+        # order is important
+        scene[scene >= threshold] <- 1
+        scene[scene < threshold] <- 0
+        if(k == 1) {
+          class.sum.svm <- scene
+        }
+        else {
+          class.sum.svm <- class.sum.svm + scene
+        }
+      }
+      
+      # make name
+      if(count < 10) {
+        name <- paste0("./", folderName, "/tile_0", count, ".tif")
+      } else {
+        name <- paste0("./", folderName, "/tile_", count, ".tif")
+      }
+      # export
+      write_stars(class.sum.svm, name)
+
+    }
+  }
+
+list <- list.files("./minus17/tiles_2018")
+for (l in 1:length(list)) {
+  str <- paste0("./minus17/tiles_2018/", list[l])
+  ras <- raster(str)
+  if(l < 2) {
+    allRas2017 <- ras
+  }
+  else {
+    allRas2017 <- raster::merge(allRas2017, ras)
+  }
+}
+writeRaster(allRas2017, "./minus17/allRas2018.tif")
+```
+
+## Plot, Threshold -17
+```{r year-comp-plot, warning=FALSE, fig.show="hold", out.width="50%"}
+allRas2017 <- raster("./minus17/allRas2017.tif")
+allRas2018 <- raster("./minus17/allRas2018.tif")
+colo = viridisLite::inferno(29)
+breaks = seq(0, 29, 1)
+image(allRas2017, col = colo, breaks = breaks, main="2017")
+colo = viridisLite::inferno(31)
+breaks = seq(0, 31, 1)
+image(allRas2018, col = colo, breaks = breaks, main="2018")
+```
+
+## Comparison to Threshold = -15.3
+```{r year-comp-plot2, warning=FALSE, fig.show="hold", out.width="50%"}
+allRas2017 <- raster("./allRas2017.tif")
+allRas2018 <- raster("./allRas2018.tif")
+colo = viridisLite::inferno(29)
+breaks = seq(0, 29, 1)
+image(allRas2017, col = colo, breaks = breaks, main="2017")
+colo = viridisLite::inferno(31)
+breaks = seq(0, 31, 1)
+image(allRas2018, col = colo, breaks = breaks, main="2018")
+```
+
+## Zoom, Threshold -17
+```{r year-comp-plot23, warning=FALSE, fig.show="hold", out.width="50%"}
+allRas2017 <- read_stars("./minus17/allRas2017.tif")
+allRas2018 <- read_stars("./minus17/allRas2018.tif")
+st_crs(allRas2017) <- "EPSG:25832"
+st_crs(allRas2018) <- "EPSG:25832"
+colo = viridisLite::inferno(29)
+breaks = seq(0, 29, 1)
+image(allRas2017[study_area[1,]], col = colo, breaks = breaks, main="2017")
+colo = viridisLite::inferno(31)
+breaks = seq(0, 31, 1)
+image(allRas2018[study_area[1,]], col = colo, breaks = breaks, main="2018")
+st_crs(allRas2018) <- "EPSG:25832"
+```
+
+### Load RainData
+```{r, warning=FALSE, echo=FALSE}
+rain_all_2017 <- read_stars("rain_2017_clip_ordered.tif")
+info = gdalinfo("rain_2017_clip_ordered.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+rainDates2017 <- as_date(descr)
+study_area_rain <- st_transform(study_area, crs=st_crs(rain_all_2017))
+# rain_all <- rain_all[shape_rain]
+rain_all_2017 <- st_set_dimensions(rain_all_2017, 3, values = rainDates2017, names = "time")
+# cut
+rain_all_2017 <- rain_all_2017[study_area_rain[1,]]
+rain_all_2017 <- aggregate(rain_all_2017, by="3 days", sum)
+rain.all.2017.df <- as.data.frame(st_apply(rain_all_2017, "time", mean, na.rm = TRUE))
+
+rain_all_2018 <- read_stars("rain_clip.tif")
+all_days <- seq(as.Date("2018-01-01"), as.Date("2018-12-31"), by="days")
+# rain_all <- rain_all[shape_rain]
+rain_all_2018 <- st_set_dimensions(rain_all_2018, 3, values = all_days, names = "time")
+# cut
+rain_all_2018 <- rain_all_2018[study_area_rain[1,]]
+rain_all_2018 <- aggregate(rain_all_2018, by="3 days", sum)
+rain.all.2018.df <- as.data.frame(st_apply(rain_all_2018, "time", mean, na.rm = TRUE))
+```
+
+## Monitor Moorflächen
+```{r, warning=FALSE, out.width='100%'}
+# cut shapefile to area of interest
+inter_shape <- shape[lengths(st_intersects(shape, study_area[1,])) != 0,]
+plot(inter_shape)
+
+# load
+moor2017 <- loadPolygon(inter_shape, 2017)
+plot(moor2017)
+
+# set - 23 as Threshold for open water
+moor2017[moor2017[1,,,] < -23.5] <- NA
+# plot(moor2017)
+
+makeTimeSeries <- function(stars, shape) {
+  # for each shape
+  for (i in 1:length(shape$Förderung)) {
+    cut <- stars[shape[i,]]
+    cut <- as.data.frame(st_apply(cut, "time", mean, na.rm = TRUE))
+    
+    if(!is.na(shape[i,]$Förderung)) {
+      names(cut) <- c("time", paste0("F", i, "VV"), paste0("F", i, "VH"))
+    } else {
+      names(cut) <- c("time", paste0(i, "VV"), paste0(i, "VH")) 
+    }
+    
+    # at first iteration
+    if(i == 1) {
+      # create master df
+      df <- cut
+    # at every ther iteration
+    } else {
+      # append
+      df <- cbind(df, cut[,2:3])
+    }
+  }
+  return(df)
+}
+
+plotTimeSeries <- function(df, year) {
+  if(year==2017) {
+    rain.select <- rain.all.2017.df
+  } else {
+    if(year==2018) {
+      rain.select <- rain.all.2018.df
+    }
+    else {
+      if(class(year) == "data.frame") {
+        rain.select <- year
+      }
+    }
+  }
+  g <- ggplot() + geom_bar(aes(x=rain.select$time, y=rain.select$mean), stat='identity', fill = "red", alpha = 0.8) + coord_cartesian(ylim=c(0,35)) + ggtitle("Mean of Moorflächen (*2) plotted against Precipitation (3 day sum) \nblue = in Förderung, black = nicht in Förderung") + xlab("Time") + ylab("Precipitation in mm, Backscatter VV")
+  #+ scale_y_continuous(sec.axis = sec_axis(~. /10 + 22, name = "Intensity + 22"))
+  # select VV columns
+  for (i in seq(2, ncol(df), 2)) {
+    if(names(df)[i] == paste0("F", i/2, "VV")) {
+      g <- g + geom_line(aes_string(x=df[,1], y = df[,i]*2 + 44, alpha = 0.7), color = "blue")
+      g <- g + geom_point(aes_string(x=df[,1], y = df[,i]*2 + 44, alpha = 0.7), color = "blue")
+    } else {
+      g <- g + geom_line(aes_string(x=df[,1], y = df[,i]*2 + 44), alpha = 0.3)
+    }
+  }
+  print(g)
+}
+
+df <- makeTimeSeries(moor2017, inter_shape)
+plotTimeSeries(df, 2017)
+
+# load
+moor2018 <- loadPolygon(inter_shape, 2018)
+
+# set - 23 as Threshold for open water
+moor2018[moor2018[1,,,] < -23.5] <- NA
+
+plotTimeSeries(makeTimeSeries(moor2018, inter_shape), 2018)
+
+dff <- rbind(makeTimeSeries(moor2017, inter_shape), makeTimeSeries(moor2018, inter_shape))
+plotTimeSeries(dff, year = rbind(rain.all.2017.df, rain.all.2018.df))
+```
+
+```{r}
+dfff <- dff[,c(1,seq(2,ncol(dff), 2))]
+gef <- c(1)
+ngef <- c(1)
+for (i in 2:length(names(dfff))) {
+  str <- paste0("F", i - 1, "VV")
+  if(names(dfff)[i] == str) {
+    gef <- c(gef, i)
+  } else {
+    ngef <- c(ngef, i)
+  }
+}
+
+inF <- dfff[,gef]
+ninF <- dfff[,ngef]
+
+inF$Mean <- rowMeans(inF[,2:ncol(inF)])
+ninF$Mean <- rowMeans(ninF[,2:ncol(ninF)])
+
+dfM <- cbind(inF[,c(1, ncol(inF))], ninF$Mean, ninF$Mean)
+names(dfM) <- c("time", "F1VV", "1XX", "1VV")
+
+plotTimeSeries(dfM, year = rbind(rain.all.2017.df, rain.all.2018.df))
+```
+
+### Load New Rain Data
+### Load RainData
+```{r, warning=FALSE, echo=FALSE}
+rain_all_2017 <- read_stars("rain_2017_clip_ordered.tif")
+info = gdalinfo("rain_2017_clip_ordered.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+rainDates2017 <- as_date(descr)
+rain_all_2017 <- st_set_dimensions(rain_all_2017, 3, values = rainDates2017, names = "time")
+
+# take all rain from study_area 1, since it is approximated anyway
+# therefore cutting to inter_shape (moor shapes) is not expected to bring much benefit
+study_area_rain <- st_transform(study_area, crs=st_crs(rain_all_2017))
+rain_all_2017 <- rain_all_2017[study_area_rain[1,]]
+# rain_all_2017 <- aggregate(rain_all_2017, by="3 days", sum)
+rain.all.2017.df <- as.data.frame(st_apply(rain_all_2017, "time", mean, na.rm = TRUE))
+
+rain_all_2018 <- read_stars("rain_clip.tif")
+all_days <- seq(as.Date("2018-01-01"), as.Date("2018-12-31"), by="days")
+rain_all_2018 <- st_set_dimensions(rain_all_2018, 3, values = all_days, names = "time")
+
+rain_all_2018 <- rain_all_2018[study_area_rain[1,]]
+# rain_all_2018 <- aggregate(rain_all_2018, by="3 days", sum)
+rain.all.2018.df <- as.data.frame(st_apply(rain_all_2018, "time", mean, na.rm = TRUE))
+```
+
+## Look at Means
+```{r, out.width="100%"}
+head(dfM)
+# delete the column needed for plotting function
+dfM <- dfM[,c(1,2,4)]
+# all acquisitions are 12 days apart, the first one is 8.1.2017
+
+# rain
+rain.all <- rbind(rain.all.2017.df, rain.all.2018.df)
+
+# make sum rain vector
+vec <- c(rain.all[1,2] + rain.all[2,2] + rain.all[3,2] + rain.all[4,2] + rain.all[5,2] + rain.all[6,2] + rain.all[7,2] + rain.all[8,2])
+for (i in 1:nrow(dfM)-1) {
+  offset <- 8
+  inter <- 12
+  count <- i - 1
+  start <- count*inter + offset + 1
+  end <- i * inter + offset
+  sum <- 0
+  # print(c(start, end))
+  for (j in start:end) {
+    sum <- sum + rain.all[j,2]
+  }
+  vec <- c(vec, sum)
+}
+
+df <- cbind(dfM, vec)
+names(df) <- c("time", "FVV", "nFVV", "prec")
+
+ggplot(df, aes(x = time)) + 
+  geom_bar(aes(x = time - 6, y = prec), stat = 'identity', fill = "lightblue", alpha = 0.8) + 
+  geom_line(aes(y = FVV * 4 + 70, color = "in Förderung")) +
+  geom_point(aes(y = FVV * 4 + 70, color = "in Förderung")) +
+  geom_line(aes(y = nFVV * 4 + 70, color = "nicht in Förderung")) +
+  coord_cartesian(ylim = c(0,60)) + 
+  ggtitle("Mean of Moorflächen and Precipitation") + xlab("Time") +
+  ylab("Precipitation in mm/m²") + 
+  scale_y_continuous(sec.axis = sec_axis(~. *0.25 -17.5, name = "Intensity in dB")) + 
+  scale_color_manual(name = "Förderung", values = c("in Förderung"="blue", "nicht in Förderung"="black")) +
+  theme(legend.position = "bottom")
+```
+
+```{r, out.width="100%"}
+# make sum rain vector
+vec <- c(rain.all[1,2] + rain.all[2,2] + rain.all[3,2] + rain.all[4,2] + rain.all[5,2] + rain.all[6,2] + rain.all[7,2] + rain.all[8,2])
+for (i in 1:nrow(dfM)-1) {
+  offset <- 8
+  inter <- 12
+  count <- i - 1
+  start <- count*inter + offset + 1
+  end <- i * inter + offset
+  sum <- 0
+  # print(c(start, end))
+  weight <- 1
+  for (j in start:end) {
+    sum <- sum + (1/weight * rain.all[j,2])
+    weight <- weight + 1
+  }
+  vec <- c(vec, sum)
+}
+
+gf <- cbind(dfM, vec)
+names(gf) <- c("time", "FVV", "nFVV", "prec")
+
+ggplot(gf, aes(x = time)) + 
+  geom_bar(aes(x = time - 6, y = prec), stat = 'identity', fill = "lightblue", alpha = 0.8) + 
+  geom_line(aes(y = FVV * 1.5 + 28, color = "in Förderung")) +
+  geom_point(aes(y = FVV * 1.5 + 28, color = "in Förderung")) +
+  geom_line(aes(y = nFVV * 1.5 + 28, color = "nicht in Förderung")) +
+  coord_cartesian(ylim = c(0,25)) + 
+  ggtitle("Mean of Moorflächen and Precipitation, Weight: 1 / # of Day") + xlab("Time") +
+  ylab("Precipitation in mm/m²") + 
+  scale_y_continuous(sec.axis = sec_axis(~. *2/3 - 56/3, name = "Intensity in dB")) + 
+  scale_color_manual(name = "Förderung", values = c("in Förderung"="blue", "nicht in Förderung"="black")) +
+  theme(legend.position = "bottom")
+```
+
+## Normalized Difference VV - Rain
+```{r, out.width="100%"}
+head(df)
+dff <- df
+dff$FVVbyprec <- (25 + dff$FVV - dff$prec) / (25 + dff$FVV + dff$prec)
+
+
+ggplot(dff, aes(x = time)) + 
+  geom_line(aes(x = time - 6, y = FVVbyprec)) +
+  
+  geom_bar(aes(x =time - 6, y = prec), stat = 'identity', fill = "lightblue", alpha = 0.8) + 
+  geom_line(aes(y = FVV * 4 + 70, color = "in Förderung")) +
+  geom_point(aes(y = FVV * 4 + 70, color = "in Förderung")) +
+  geom_line(aes(y = nFVV * 4 + 70, color = "nicht in Förderung")) +
+  coord_cartesian(ylim = c(-5,40)) + 
+  ggtitle("Mean of Moorflächen and Precipitation") + xlab("Time") +
+  ylab("Precipitation in mm/m²") + 
+  scale_y_continuous(sec.axis = sec_axis(~. *0.25 -17.5, name = "Intensity in dB")) + 
+  scale_color_manual(name = "Förderung", values = c("in Förderung"="blue", "nicht in Förderung"="black")) +
+  theme(legend.position = "bottom")
+```
+
+```{r, out.width="100%"}
+dff$Fchange <- 1:nrow(dff)
+for (i in 2:nrow(dff)) {
+  dff[i,6] <- (dff[i,2] - dff[i-1,2]) / (dff[i,2] + dff[i-1,2])
+}
+dff$Rchange <- 1:nrow(dff)
+for (i in 2:nrow(dff)) {
+  dff[i,7] <- (dff[i,4] - dff[i-1,4]) / (dff[i,4] + dff[i-1,4])
+}
+dff$FRchange <- 1:nrow(dff)
+for (i in 2:nrow(dff)) {
+  dff[i,8] <- (dff[i,6] - dff[i-1,7]) / (dff[i,6] + dff[i-1,7])
+}
+
+# normalized change of normalized change over time with previous time step
+
+ggplot(dff, aes(x = time)) + 
+  geom_line(aes(x = time - 6, y = FRchange)) +
+  
+  geom_bar(aes(x =time - 6, y = prec), stat = 'identity', fill = "lightblue", alpha = 0.8) + 
+  geom_line(aes(y = FVV * 4 + 70, color = "in Förderung")) +
+  geom_point(aes(y = FVV * 4 + 70, color = "in Förderung")) +
+  geom_line(aes(y = nFVV * 4 + 70, color = "nicht in Förderung")) +
+  coord_cartesian(ylim = c(-5,40)) + 
+  ggtitle("Mean of Moorflächen and Precipitation") + xlab("Time") +
+  ylab("Precipitation in mm/m²") + 
+  scale_y_continuous(sec.axis = sec_axis(~. *0.25 -17.5, name = "Intensity in dB")) + 
+  scale_color_manual(name = "Förderung", values = c("in Förderung"="blue", "nicht in Förderung"="black")) +
+  theme(legend.position = "bottom")
+```
+
+## cumulative sum
+```{r, out.width="50%", fig.show="hold"}
+# make cumsum
+dff$Rsum <- cumsum(dff$prec - mean(dff$prec[1:30]))
+
+# start from mean prec
+dff$prec_1 <- c(mean(dff$prec[1:30]), dff$prec[2:60])
+dff$Rsum_1 <- cumsum(dff$prec_1 - mean(dff$prec[1:30]))
+# calc means
+mean(dff$prec) # all
+mean(dff$prec[1:30]) # 2017
+mean(dff$prec[31:60]) # 2018
+dff$Rsum <- dff$Rsum - mean(dff$prec)
+
+# ggplot(dff[1:30,], aes(x = time)) +
+#   geom_bar(aes(y = Rsum / 50), stat = 'identity') +
+#   geom_line(aes(y = FVV + 11.5)) +
+#   ggtitle("cumsum rain, scaled")
+
+# ggplot(dff[1:30,], aes(x = time)) +
+#   geom_line(aes(y = Rsum / 50), color="lightblue") +
+#   geom_line(aes(y = FVV + 11.5)) +
+#   ggtitle("cumsum rain, scaled")
+
+# R sum 1
+ggplot(dff[1:30,], aes(x = time)) +
+  geom_bar(aes(y = Rsum_1 / 50), stat = 'identity') +
+  geom_line(aes(y = FVV + 12)) +
+  ggtitle("cumsum rain, scaled, starting at 1 = mean")
+
+ggplot(dff[1:30,], aes(x = time)) +
+  geom_line(aes(y = Rsum_1 / 50), color="lightblue") +
+  geom_line(aes(y = FVV + 12)) +
+  ggtitle("cumsum rain, scaled, starting at 1 = mean")
+
+# weighted stuff
+gf$Rsum <- cumsum(gf$prec - mean(gf$prec[1:30]))
+
+ggplot(gf[1:30,], aes(x = time)) +
+  geom_bar(aes(y = Rsum / 10), stat = 'identity') +
+  geom_line(aes(y = FVV + 11.5)) +
+  ggtitle("cumsum weighted rain, 2017")
+
+ggplot(gf[1:30,], aes(x = time)) +
+  geom_line(aes(y = Rsum / 10), color="lightblue") +
+  geom_line(aes(y = FVV + 11.5)) +
+  ggtitle("cumsum weighted rain, 2017")
+
+# 2018
+dff$Rsum[31:60] <- cumsum(dff$prec[31:60] - mean(dff$prec[31:60]))
+
+ggplot(dff[31:60,], aes(x = time)) +
+  geom_line(aes(y = Rsum / 4), color="lightblue") +
+  geom_line(aes(y = FVV + 17)) +
+  ggtitle("cumsum rain 2018, scaled, - mean 2018")
+
+ggplot(dff[1:30,], aes(x = time)) + 
+  geom_bar(aes(x =time - 6, y = prec), stat = 'identity', fill = "lightblue", alpha = 0.8) + 
+  geom_line(aes(y = FVV * 4 + 70, color = "in Förderung")) +
+  geom_point(aes(y = FVV * 4 + 70, color = "in Förderung")) +
+  geom_line(aes(y = nFVV * 4 + 70, color = "nicht in Förderung")) +
+  geom_hline(yintercept = mean(dff$prec[1:30]), color = "lightblue") +
+  coord_cartesian(ylim = c(-5,40)) + 
+  ggtitle("Mean of Moorflächen and Precipitation") + xlab("Time") +
+  ylab("Precipitation in mm/m²") + 
+  scale_y_continuous(sec.axis = sec_axis(~. *0.25 -17.5, name = "Intensity in dB")) + 
+  scale_color_manual(name = "Legend", values = c("in Förderung"="blue", "nicht in Förderung"="black", "Mean of Precipitation 2017"="lightblue")) +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# dff$prec_2 <- c(mean(dff$prec), dff$prec[2:60])
+dff$Rsum_2 <- cumsum(dff$prec - 23)
+
+ggplot(dff, aes(x = time)) +
+  geom_bar(aes(y = Rsum_2 / 50), stat='identity') +
+  geom_line(aes(y = FVV * 1.2 + 15))
+  
+```
+
+## statistics
+```{r, fig.show="hold", out.width="50%"}
+acf(dff$prec)
+pacf(dff$prec)
+acf(dff$FVV)
+pacf(dff$FVV)
+```
+
+```{r, fig.show="hold", out.width="50%"}
+cor(dff$FVV, dff$prec)
+ccf(dff$FVV, dff$prec)
+```
+
+### R_sum1 is the cumulated sum minus the prec mean of 2017, but with pretending that the first precipitation was equal to mean (as a "start" value)
+```{r, fig.show="hold", out.width="50%"}
+ccf(dff$FVV, dff$Rsum)
+ccf(dff$FVV, dff$Rsum_1)
+acf(dff$Rsum_1)
+```
+
+```{r}
+dff$acq <- 1:nrow(dff)
+f <- function(x) sum((dff$FVV - (x[1] + x[2] * sin(pi * (dff$acq+x[3])/30)))^2)
+nlm(f,c(0,0,0))
+
+dff$FVV.per <- -13.386 + 1.61 * sin(pi*(dff$acq - 8.6715)/30)
+
+ggplot(dff, aes(x = time)) +
+  geom_line(aes(y = FVV)) + 
+  geom_line(aes(y = FVV.per, color = "red"))
+
+ggplot(dff, aes(x = time)) +
+  geom_bar(aes(y = prec / 10), stat = 'identity') + 
+  geom_line(aes(y = FVV - FVV.per + 1.8))
+
+an <- dff$FVV - dff$FVV.per
+
+an.ar5 = arima(an, c(5,0,0))
+an.ar5
+acf(an, type="partial")
+arima(an, c(1,0,0))$aic
+
+dfh <- dff[1:30,]
+n <- 4
+f <- function(x) sum((dfh$FVV - (x[1] + x[2] * sin(pi * (dfh$acq+x[3])/n)))^2)
+mod <- nlm(f,c(0,0,0))
+dfh$FVV.per <- mod$estimate[1] + mod$estimate[2] * sin(pi*(dfh$acq + mod$estimate[3])/n)
+
+ ggplot(dfh, aes(x = time)) +
+   geom_line(aes(y = FVV)) + 
+   geom_line(aes(y = FVV.per, color = "red"))
+
+n <- 30
+f <- function(x) sum((dff$prec - (x[1] + x[2] * sin(pi * (dff$acq+x[3])/n)))^2)
+mod <- nlm(f,c(0,0,0))
+dff$prec.per <- mod$estimate[1] + mod$estimate[2] * sin(pi*(dff$acq + mod$estimate[3])/n)
+
+ggplot(dff, aes(x = time)) +
+  geom_line(aes(y = FVV)) + 
+  geom_line(aes(y = prec.per, color = "prec")) +
+  geom_line(aes(y = FVV.per * 10 + 150, color="FVV")) +
+  ggtitle("Annual Trends, scaled")
+
+ggplot(dff, aes(x = time)) +
+ # geom_bar(aes(y = prec / 10, color = "rain"), stat = 'identity') + 
+  geom_bar(aes(y = (prec - prec.per) / 10, color = "residuals"), stat = 'identity') +
+  geom_line(aes(y = FVV - FVV.per + 1.8)) +
+  ggtitle("residual rain and residual VV")
+```

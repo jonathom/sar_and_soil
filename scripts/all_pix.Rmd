@@ -1,0 +1,112 @@
+---
+title: "Investigating wetland scatter"
+author: "Jonathan Bahlmann"
+# date: "`r format(Sys.time(), "%d.%m.%Y")`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading Data
+Set wd and load packages.
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+```
+
+## As stars proxy
+Intensity data is handled here.
+```{r, echo=FALSE}
+# load files as proxy
+int_VV <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH <- read_stars("VH_clip.tif", proxy=TRUE)
+# assign names
+names(int_VV) <- "VV"
+names(int_VH) <- "VH"
+# transform shape into crs of intensity dataset
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV))
+```
+
+## Spatial Extent
+The desired spatial extent can be set via subsetting: `[extent_object]`.
+```{r, echo=FALSE}
+# now load extent (polygon) into memory
+int_vv <- st_as_stars(int_VV[shape[124,]])
+int_vh <- st_as_stars(int_VH[shape[124,]])
+```
+
+## Time Dimension
+```{r}
+dates <- c(ymd("2018-01-03"), ymd("2018-01-15"), ymd("2018-01-27"), ymd("2018-02-08"), ymd("2018-02-20"), ymd("2018-03-04"), ymd("2018-03-16"), ymd("2018-03-28"), ymd("2018-04-09"), ymd("2018-04-21"), ymd("2018-05-03"), ymd("2018-05-15"), ymd("2018-05-27"), ymd("2018-06-08"), ymd("2018-06-20"), ymd("2018-07-02"), ymd("2018-07-14"), ymd("2018-07-26"), ymd("2018-08-07"), ymd("2018-08-19"), ymd("2018-08-31"), ymd("2018-09-12"), ymd("2018-09-24"), ymd("2018-10-06"), ymd("2018-10-18"), ymd("2018-10-30"), ymd("2018-11-11"), ymd("2018-11-23"), ymd("2018-12-05"), ymd("2018-12-17"), ymd("2018-12-29"))
+int_vv <- st_set_dimensions(int_vv, 3, values = dates, names = "time")
+int_vh <- st_set_dimensions(int_vh, 3, values = dates, names = "time")
+```
+
+## Rain
+Needs to be freshly warped for some reason, can't be saved (`write_stars`) and then loaded. But: rain_warped.tif is a file with already aggregated rain data (31 time steps instead of 365).
+```{r, echo=FALSE}
+# rain <- read_stars("rain_warped.tif", proxy=TRUE)
+# names(rain) <- "prec"
+# rain <- st_warp(rain, int_VV)
+# rain <- readRDS("rain_warped_3daysum.rds")
+# rain <- rain[shape[124,]]
+# rain <- st_set_dimensions(rain, 3, values = dates, names = "time")
+```
+## Combine
+Then combine all three. Give `along = "bands"` so that all attributes are treated as bands.
+```{r, echo=FALSE}
+# c()
+comb <- c(int_vv, int_vh, along="bands")
+```
+## switch bands to attributes
+This is more of a design choice.
+```{r}
+comb_split <- split(comb, "bands")
+names(comb_split) <- c("VV", "VH")
+comb_split
+```
+
+## Time Series for *all* (a Number of) Pixels
+Giving the opportunity of constructing very different results. Depending on whether neighboring pixels or random pixels are selected, similarities and differences are seen.
+```{r}
+# make first attribute, pixel 10/10 into dataframe template
+pix.df <- as.data.frame(comb_split[1,100,100,])[,3:4]
+# make data frame for all pixels
+for (i in 1:nrow(comb_split)) {
+  for (j in 1:ncol(comb_split)) {
+    if (is.na(comb_split[1,i,j,1][[1]])) {
+    }
+    else {
+      pix.df <- cbind(pix.df, as.vector(comb_split[1,i,j,][[1]]))
+    }
+  }
+}
+# delete template data frame column
+pix.df <- pix.df[,c(1,3:ncol(pix.df))]
+# assign numbers as names
+f <- ncol(pix.df) - 1
+names(pix.df) <- c("time", seq(1,f,1))
+```
+
+Here we have the possibility to select which pixels are plotted. For example each 37th pixel in the dataframe:
+
+```{r, warning=FALSE}
+# initiate plot
+p <- ggplot(data=pix.df, aes(x=pix.df$time)) + ylab("VV")
+# make sequence of pixel positions to plot
+ind <- seq(2,9263, 17)
+# loop
+for (i in ind) { p <- p + geom_line(aes_string(y = pix.df[,i]), alpha = 0.1) }
+p
+```

@@ -1,0 +1,293 @@
+---
+title: "Connect Data from 2017 and 2018"
+author: "Jonathan Bahlmann"
+date: "10/19/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+library(e1071)
+```
+
+## Load data
+Intensity and shapefile data is handled here.
+```{r loading-data, echo=FALSE}
+# load files as proxy
+int_VV_2017 <- read_stars("VV_2017_clip.tif", proxy=TRUE)
+int_VH_2017 <- read_stars("VH_2017_clip.tif", proxy=TRUE)
+int_VV_2018 <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH_2018 <- read_stars("VH_clip.tif", proxy=TRUE)
+# assign names
+names(int_VV_2017) <- "VV"
+names(int_VH_2017) <- "VH"
+names(int_VV_2018) <- "VV"
+names(int_VH_2018) <- "VH"
+# monitoring waters
+water_shape_2017 <- read_sf("water (copy).shp")
+water_shape_2018 <- read_sf("water.shp")
+water_shape_2017_july07 <- read_sf("water_shape_intersec.shp")
+# study area
+study_area <- read_sf("study_area.shp")
+# shape
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV_2018))
+# moni
+moni <- read_sf("moni_shap.shp")
+# double bounce
+db <- read_sf("double_bounce.shp")
+
+# water_general <- water_shape_2017[lengths(st_intersects(water_shape_2017, water_shape_2018)) != 0,]
+```
+
+```{r make-dates}
+# make dates
+info = gdalinfo("VV_2017_clip.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+dates2017 <- as_date(descr)
+
+info = gdalinfo("VV_clip.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+dates2018 <- as_date(descr)
+```
+
+```{r load-polygon-func}
+# function takes a shape as an AOI and a year (2017 or 2018)
+loadPolygon <- function(shape, year) {
+  if(year == 2017) {
+    int_VV <- int_VV_2017
+    int_VH <- int_VH_2017
+    dates <- dates2017
+  } else {
+    if(year == 2018) {
+      int_VV <- int_VV_2018
+      int_VH <- int_VH_2018
+      dates <- dates2018
+    } else {
+      return("wrong year entered!")
+    }
+  }
+  int_vv <- st_as_stars(int_VV[shape])
+  int_vh <- st_as_stars(int_VH[shape])
+  int_vv <- st_set_dimensions(int_vv, 3, val = dates, names = "time")
+  int_vh <- st_set_dimensions(int_vh, 3, val = dates, names = "time")
+  # c()
+  comb <- c(int_vv, int_vh, along="bands")
+  # switch bands to attributes, this is more of a design choice.
+  comb_split <- split(comb, "bands")
+  names(comb_split) <- c("VV", "VH")
+  return(comb_split)
+}
+```
+
+## Make Thresholded Rasters
+```{r, warning=FALSE, eval=FALSE}
+ext <- study_area[3,]
+# folderName <- "./tiles_thresh/db20"
+# folderName <- "./tiles_data_thresh/down"
+# tiles171410
+folderName <- "./tiles_2018_3/down"
+folderName <- "./tiles_2018_3/middle"
+folderName <- "./tiles_2018_3/up"
+
+dir.create(folderName)
+# threshold <- -15.34187
+# thresholds must be < 0; smaller value first
+#interval <- c(-35, -22.5)
+#interval <- c(-22.5, -8.269646)
+#interval <- c(-8.269646, 20)
+
+#interval <- c(-22.5, -17.55717)
+#interval <- c(-17.55717, -13)
+#interval <- c(-13, -8.269646)
+
+interval <- c(-17.55717, -14)
+interval <- c(-14, -10)
+interval <- c(-10, -8.269646)
+
+dates <- dates2018
+year <- 2018
+
+  # bbox can be used for stars subsetting []
+  ext <- st_bbox(ext) # ext is xmin ymin xmax ymax
+  # study area one has 11860, 10.000 seems OK tile size
+  # calculate span
+  x.span <- ext[3] - ext[1] # X
+  y.span <- ext[4] - ext[2] # Y
+  # calc good number of cuts
+  x.cuts <- ceiling(x.span / 10000)
+  y.cuts <- ceiling(y.span / 10000)
+  # calc cut length
+  x.cut.by <- x.span / x.cuts
+  y.cut.by <- y.span / y.cuts
+
+  # tile counter
+  count <- 0
+  # go through all cuts in X direction
+  for (i in 1:x.cuts) {
+    # go through all cuts in Y direction
+    for (j in 1:y.cuts) {
+      count <- count + 1
+      # make extent object
+      xmin <- ext[1] + (i - 1) * x.cut.by
+      xmax <- ext[1] + i * x.cut.by
+      ymin <- ext[2] + (j - 1) * y.cut.by
+      ymax <- ext[2] + j * y.cut.by
+      
+      cutbox <- ext
+      cutbox[1] <- xmin
+      cutbox[2] <- ymin
+      cutbox[3] <- xmax
+      cutbox[4] <- ymax
+      
+      # load stars  
+      tile <- loadPolygon(cutbox, year)
+    
+      # create sum
+      for (k in 1:length(dates)) {
+        scene <- tile[1,,,k]
+        copy <- scene
+        # order is important
+        # scene[scene >= threshold] <- 1
+        # scene[scene < threshold] <- 0
+        
+        #copy[scene > interval[2]] <- 0
+        #copy[scene < interval[1]] <- 0
+        #scene[copy != 0] <- 1
+        
+        scene[scene > interval[2]] <- 0
+        scene[scene < interval[1]] <- 0
+        scene[scene != 0] <- 1
+        
+        if(k == 1) {
+          class.sum.svm <- scene
+        }
+        else {
+          class.sum.svm <- class.sum.svm + scene
+        }
+      }
+      
+      # make name
+      if(count < 10) {
+        name <- paste0(folderName, "/tile_0", count, ".tif")
+      } else {
+        name <- paste0(folderName, "/tile_", count, ".tif")
+      }
+      # export
+      write_stars(class.sum.svm, name)
+
+    }
+  }
+# make rasters for remaining two folder in 2017
+# folderName <- "./tiles_thresh/water-22.5"
+folderName <- "./tiles_2018_1/down"
+folderName <- "./tiles_2018_1/middle"
+folderName <- "./tiles_2018_1/up"
+
+list <- list.files(folderName)
+for (l in 1:length(list)) {
+  str <- paste0(folderName, "/", list[l])
+  ras <- raster(str)
+  if(l < 2) {
+    allRas <- ras
+  }
+  else {
+    allRas <- raster::merge(allRas, ras)
+  }
+}
+writeRaster(allRas, paste0(folderName, "allRas.tif"))
+```
+
+
+
+## Make Thresholded Rasters
+```{r, warning=FALSE, eval=FALSE}
+ext <- study_area[3,]
+# folderName <- "./tiles_thresh/db20"
+# folderName <- "./tiles_data_thresh/down"
+folderName <- "./mean_2018"
+
+dir.create(folderName)
+
+dates <- dates2018
+year <- 2018
+
+  # bbox can be used for stars subsetting []
+  ext <- st_bbox(ext) # ext is xmin ymin xmax ymax
+  # study area one has 11860, 10.000 seems OK tile size
+  # calculate span
+  x.span <- ext[3] - ext[1] # X
+  y.span <- ext[4] - ext[2] # Y
+  # calc good number of cuts
+  x.cuts <- ceiling(x.span / 10000)
+  y.cuts <- ceiling(y.span / 10000)
+  # calc cut length
+  x.cut.by <- x.span / x.cuts
+  y.cut.by <- y.span / y.cuts
+
+  # tile counter
+  count <- 0
+  # go through all cuts in X direction
+  for (i in 1:x.cuts) {
+    # go through all cuts in Y direction
+    for (j in 1:y.cuts) {
+      count <- count + 1
+      # make extent object
+      xmin <- ext[1] + (i - 1) * x.cut.by
+      xmax <- ext[1] + i * x.cut.by
+      ymin <- ext[2] + (j - 1) * y.cut.by
+      ymax <- ext[2] + j * y.cut.by
+      
+      cutbox <- ext
+      cutbox[1] <- xmin
+      cutbox[2] <- ymin
+      cutbox[3] <- xmax
+      cutbox[4] <- ymax
+      
+      # load stars  
+      tile <- loadPolygon(cutbox, year)
+
+      class.sum.svm <- st_apply(tile, c("x", "y"), mean, na.rm = TRUE)
+      
+      # make name
+      if(count < 10) {
+        name <- paste0(folderName, "/tile_0", count, ".tif")
+      } else {
+        name <- paste0(folderName, "/tile_", count, ".tif")
+      }
+      # export
+      write_stars(class.sum.svm, name)
+
+    }
+  }
+# make rasters for remaining two folder in 2017
+folderName <- "./mean"
+
+list <- list.files(folderName)
+for (l in 1:length(list)) {
+  str <- paste0(folderName, "/", list[l])
+  ras <- raster(str)
+  if(l < 2) {
+    allRas <- ras
+  }
+  else {
+    allRas <- raster::merge(allRas, ras)
+  }
+}
+writeRaster(allRas, paste0(folderName, "allRas.tif"))
+```

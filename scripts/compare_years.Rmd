@@ -1,0 +1,397 @@
+---
+title: "Compare Years, Look Into 2017"
+author: "Jonathan Bahlmann"
+date: "10/16/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+library(e1071)
+```
+
+## Load data
+Intensity and shapefile data is handled here.
+```{r loading-data, echo=FALSE}
+# load files as proxy
+int_VV <- read_stars("VV_2017_clip.tif", proxy=TRUE)
+int_VH <- read_stars("VH_2017_clip.tif", proxy=TRUE)
+# assign names
+names(int_VV) <- "VV"
+names(int_VH) <- "VH"
+# monitoring waters
+water_shape <- read_sf("water (copy).shp")
+# study area
+study_area <- read_sf("study_area.shp")
+# shape
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV))
+# moni
+moni <- read_sf("moni_shap.shp")
+# double bounce
+db <- read_sf("double_bounce.shp")
+# make dates
+info = gdalinfo("VV_2017_clip.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+dates2017 <- as_date(descr)
+dates <- dates2017
+```
+
+## Make Thresholded Raster for 2017, Same Threshold as 2018
+Cut 2017 VV TIF to the used extent. 
+
+```{r make-func, echo=FALSE, warning=FALSE}
+info = gdalinfo("VV_2017_clip.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+dates2017 <- as_date(descr)
+
+# dates2018 <- c(ymd("2018-01-03"), ymd("2018-01-15"), ymd("2018-01-27"), ymd("2018-02-08"), ymd("2018-02-20"), ymd("2018-03-04"), ymd("2018-03-16"), ymd("2018-03-28"), ymd("2018-04-09"), ymd("2018-04-21"), ymd("2018-05-03"), ymd("2018-05-15"), ymd("2018-05-27"), ymd("2018-06-08"), ymd("2018-06-20"), ymd("2018-07-02"), ymd("2018-07-14"), ymd("2018-07-26"), ymd("2018-08-07"), ymd("2018-08-19"), ymd("2018-08-31"), ymd("2018-09-12"), ymd("2018-09-24"), ymd("2018-10-06"), ymd("2018-10-18"), ymd("2018-10-30"), ymd("2018-11-11"), ymd("2018-11-23"), ymd("2018-12-05"), ymd("2018-12-17"), ymd("2018-12-29"))
+
+loadPolygon <- function(shape, dates) {
+# This polygon is being looked at: polyID
+int_vv <- st_as_stars(int_VV[shape])
+int_vh <- st_as_stars(int_VH[shape])
+int_vv <- st_set_dimensions(int_vv, 3, val = dates, names = "time")
+int_vh <- st_set_dimensions(int_vh, 3, val = dates, names = "time")
+# c()
+comb <- c(int_vv, int_vh, along="bands")
+# switch bands to attributes, this is more of a design choice.
+comb_split <- split(comb, "bands")
+names(comb_split) <- c("VV", "VH")
+return(comb_split)
+}
+```
+
+```{r make-2017-tiles, eval=FALSE, echo=FALSE, warning=FALSE}
+ext <- study_area[3,]
+folderName <- "tiles_2017"
+threshold <- -15.34187
+dates <- dates2017
+
+  # bbox can be used for stars subsetting []
+  ext <- st_bbox(ext) # ext is xmin ymin xmax ymax
+  # study area one has 11860, 10.000 seems OK tile size
+  # calculate span
+  x.span <- ext[3] - ext[1] # X
+  y.span <- ext[4] - ext[2] # Y
+  # calc good number of cuts
+  x.cuts <- ceiling(x.span / 10000)
+  y.cuts <- ceiling(y.span / 10000)
+  # calc cut length
+  x.cut.by <- x.span / x.cuts
+  y.cut.by <- y.span / y.cuts
+
+  # tile counter
+  count <- 0
+  # go through all cuts in X direction
+  for (i in 1:x.cuts) {
+    # go through all cuts in Y direction
+    for (j in 1:y.cuts) {
+      count <- count + 1
+      # make extent object
+      xmin <- ext[1] + (i - 1) * x.cut.by
+      xmax <- ext[1] + i * x.cut.by
+      ymin <- ext[2] + (j - 1) * y.cut.by
+      ymax <- ext[2] + j * y.cut.by
+      
+      cutbox <- ext
+      cutbox[1] <- xmin
+      cutbox[2] <- ymin
+      cutbox[3] <- xmax
+      cutbox[4] <- ymax
+      
+      # cutbox <- extent(xmin, ymin, xmax, ymax)
+      
+      # load stars  
+      tile <- loadPolygon(cutbox, dates)
+    
+      # create sum
+      for (k in 1:length(dates)) {
+        scene <- tile[1,,,k]
+        # order is important
+        scene[scene >= threshold] <- 1
+        scene[scene < threshold] <- 0
+        if(k == 1) {
+          class.sum.svm <- scene
+        }
+        else {
+          class.sum.svm <- class.sum.svm + scene
+        }
+      }
+      
+      # make name
+      if(count < 10) {
+        name <- paste0("./", folderName, "/tile_0", count, ".tif")
+      } else {
+        name <- paste0("./", folderName, "/tile_", count, ".tif")
+      }
+      # export
+      write_stars(class.sum.svm, name)
+
+    }
+  }
+
+list <- list.files("./tiles_2017")
+for (l in 1:length(list)) {
+  str <- paste0("./tiles_2017/", list[l])
+  ras <- raster(str)
+  if(l < 2) {
+    allRas2017 <- ras
+  }
+  else {
+    allRas2017 <- raster::merge(allRas2017, ras)
+  }
+}
+writeRaster(allRas2017, "allRas2017.tif", overwrite=TRUE)
+```
+
+```{r load-ras}
+allRas2017 <- raster("allRas2017.tif")
+allRas2018 <- raster("allRas2018.tif")
+```
+
+```{r year-comp-plot, warning=FALSE, fig.show="hold", out.width="50%"}
+colo = viridisLite::inferno(29)
+breaks = seq(0, 29, 1)
+image(allRas2017, col = colo, breaks = breaks, main="2017")
+colo = viridisLite::inferno(31)
+breaks = seq(0, 31, 1)
+image(allRas2018, col = colo, breaks = breaks, main="2018")
+```
+
+```{r diff-plot, warning=FALSE}
+change <- raster("norm_change_17_18.tif")
+colo = viridisLite::inferno(20)
+breaks = seq(-1, 1, 0.1)
+image(change, col = colo, breaks = breaks, main="Normalized Change 2017 - 2018", xlim=c(730000, 770000))
+```
+
+```{r plot-2017, eval=FALSE}
+plot2017 <- loadPolygon(shape[124,], dates2017)
+plot(plot2017[1,,,])
+```
+
+## Rain 2017
+```{r, echo=FALSE, eval=FALSE}
+info = gdalinfo("rain_2017_clip_ordered.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+rainDates2017 <- as_date(descr)
+
+rain <- read_stars("rain_2017_clip.tif")
+rain_germ <- read_stars("ra2017m.tif")
+plot(rain[,,,301:307])
+plot(rain_germ[,,,301:307])
+# 305 must go, 246 is 01/01
+band.order = c(seq(246, 304, 1), seq(306, 366, 1), seq(1, 245, 1))
+gdal_translate("rain_2017_clip.tif", "rain_2017_clip_ordered.tif", b = band.order)
+```
+
+```{r, warning=FALSE, echo=FALSE}
+rain_all_2017 <- read_stars("rain_2017_clip_ordered.tif")
+info = gdalinfo("rain_2017_clip_ordered.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+rainDates2017 <- as_date(descr)
+study_area_rain <- st_transform(study_area, crs=st_crs(rain_all_2017))
+# rain_all <- rain_all[shape_rain]
+rain_all_2017 <- st_set_dimensions(rain_all_2017, 3, values = rainDates2017, names = "time")
+# cut
+rain_all_2017 <- rain_all_2017[study_area_rain[1,]]
+rain_all_2017 <- aggregate(rain_all_2017, by="3 days", sum)
+rain.all.2017.df <- as.data.frame(st_apply(rain_all_2017, "time", mean, na.rm = TRUE))
+
+rain_all_2018 <- read_stars("rain_clip.tif")
+all_days <- seq(as.Date("2018-01-01"), as.Date("2018-12-31"), by="days")
+# rain_all <- rain_all[shape_rain]
+rain_all_2018 <- st_set_dimensions(rain_all_2018, 3, values = all_days, names = "time")
+# cut
+rain_all_2018 <- rain_all_2018[study_area_rain[1,]]
+rain_all_2018 <- aggregate(rain_all_2018, by="3 days", sum)
+rain.all.2018.df <- as.data.frame(st_apply(rain_all_2018, "time", mean, na.rm = TRUE))
+
+rain.all.df <- cbind(rain.all.2017.df, rain.all.2018.df[,2])
+names(rain.all.df) <- c("time", "X2017", "X2018")
+ggplot(rain.all.df, aes(x=time)) +
+  geom_bar(aes(y=X2017, color="2017"), stat='identity') +
+  geom_bar(aes(y=X2018, color="2018"), stat='identity') +
+  scale_color_manual(values = c("2017"="red", "2018"="blue")) +
+  ggtitle("3 day sums of Precipitation in 2017 and 2018")
+
+rain.all.df <- cbind(rain.all.2017.df, rain.all.2018.df[,2])
+names(rain.all.df) <- c("time", "X2017", "X2018")
+ggplot(rain.all.df, aes(x=time)) +
+  geom_bar(aes(y=X2017, color="2017"), stat='identity') +
+  geom_bar(aes(y=X2018, color="2018"), stat='identity') +
+  scale_color_manual(values = c("2017"="red", "2018"="blue")) +
+  xlim(as.Date(c("2017-06-10", "2017-07-20"))) +
+  # xlim(as.Date(c("2017-07-15", "2017-08-01"))) +
+  geom_vline(xintercept = as.Date("2017-06-25")) +
+  geom_vline(xintercept = as.Date("2017-07-07")) +
+  ggtitle("Closeup of Precipitation data + S1 Acquisition Dates")
+```
+
+## Lets See What Happened End of June
+```{r load-example-area}
+# plot overview
+area1 <- loadPolygon(study_area[1,], dates2017)
+plot(area1[,,,12:17])
+```
+
+### The second big precipitation event is 24/07/2019
+```{r}
+# plot overview
+# area1 <- loadPolygon(study_area[1,], dates2017)
+plot(area1[,,,16:17])
+before <- as(area1[1,,,16], "Raster")
+after <- as(area1[1,,,17], "Raster")
+# see histograms to evaluate if the scene has gotten brighter
+hist(before)
+hist(after)
+```
+
+## Plot Scenes with Threshold, First Prec Event
+```{r, fig.show="hold", out.width="50%"}
+threshold <- -15.34187
+image(area1[,,,14], col = c("white", "black"), breaks = c(-35, threshold, 35), main="25.06., White is Smaller -15.3")
+image(area1[,,,15], col = c("white", "black"), breaks = c(-35, threshold, 35), main="07.07., White is Smaller -15.3")
+```
+```{r, fig.show="hold", out.width="50%"}
+threshold <- -20.49962
+image(area1[,,,14], col = c("white", "black"), breaks = c(-35, threshold, 35), main="25.06., White is Smaller -20.5")
+image(area1[,,,15], col = c("white", "black"), breaks = c(-35, threshold, 35), main="07.07., White is Smaller -20.5")
+```
+
+A gain in values below -20 is observed, together with a reduction of surfaces below -15. This could be a hint that -15 is not a usable water threshold.
+
+## See as RGB (even better in QGis)
+```{r, warning=FALSE}
+stack <- raster::stack(as(area1[1,,,13], "Raster"), as(area1[1,,,14], "Raster"), as(area1[1,,,15], "Raster"))
+plotRGB(stack, r=1, g=2, b=3, stretch="lin")
+```
+
+## Bigger Area, Bring Back the LazyLoad Function
+Which however only works when giving more than 1 time step which was useless when I wrote it but is perfect here. It extracts the requested timesteps fom the `stars_proxy` objects and therefore reduces computing time and resources significantly, allowing for larger areas to be loaded.
+```{r, warning=FALSE, echo=FALSE}
+# set dates global
+dates <- dates2017
+# func
+lazyLoadPolygon <- function(shape, timesteps) {
+  int_vv <- int_VV[1,,,timesteps]
+  int_vh <- int_VH[1,,,timesteps]
+  int_vv <- st_as_stars(int_vv[shape])
+  int_vh <- st_as_stars(int_vh[shape])
+  int_vv <- st_set_dimensions(int_vv, 3, val = dates[timesteps], names = "time")
+  int_vh <- st_set_dimensions(int_vh, 3, val = dates[timesteps], names = "time")
+  # c()
+  comb <- c(int_vv, int_vh, along="bands")
+  # switch bands to attributes, this is more of a design choice.
+  comb_split <- split(comb, "bands")
+  names(comb_split) <- c("VV", "VH")
+  return(comb_split)
+}
+```
+```{r, warning=FALSE}
+area2 <- lazyLoadPolygon(study_area[2,], c(13:15))
+stack <- raster::stack(as(area2[1,,,1], "Raster"), as(area2[1,,,2], "Raster"), as(area2[1,,,3], "Raster"))
+plotRGB(stack, r=1, g=2, b=3, stretch="lin", main="RGB of 13.06., 25.06. 07.07.2017")
+```
+
+```{r, eval=FALSE, echo=FALSE, warning=FALSE}
+ras <- as(area2[1,,,3], "Raster")
+ras[ras < -20.49962] <- NA
+writeRaster(ras, "testing_water_mask_07072017_20.tif", overwrite=TRUE)
+ras[ras < -15.34187] <- NA
+writeRaster(ras, "testing_water_mask_07072017_15.tif", overwrite=TRUE)
+
+ras <- as(area2[1,,,2], "Raster")
+ras[ras < -20.49962] <- NA
+writeRaster(ras, "testing_water_mask_25062017_20.tif", overwrite=TRUE)
+ras[ras < -15.34187] <- NA
+writeRaster(ras, "testing_water_mask_25062017_15.tif", overwrite=TRUE)
+```
+
+## New Water Threshold Training with Reworked Water Shape
+```{r, echo=FALSE, warning=FALSE}
+# prepare new data, WITHOUT STREET
+end <- length(water_shape$type)
+for (k in 1:end) {
+  if(water_shape[k,]$type != "mixed" && water_shape[k,]$type != "street") {
+    poly <- loadPolygon(water_shape[k,], dates)
+    # set VV, timestep
+    poly <- poly[1,,,1]
+    poly.df <- as.data.frame(poly)
+    poly.df$type <- water_shape[k,]$type
+    poly.df <- poly.df[complete.cases(poly.df),]
+    if(k == 1) {
+      val.svm <- poly.df[,4:5]
+    }
+    else {
+      val.svm <- rbind(val.svm, poly.df[,4:5])
+    }
+  }
+}
+```
+
+```{r, warning=FALSE}
+# prepare data
+val.svm$type <- as.factor(val.svm$type)
+attach(val.svm)
+x <- subset(val.svm, select=-type)
+y <- type
+# make model
+svmmod <- svm(x,y)
+# summary(svmmod)
+# make prediction, confusion matrix
+pred <- predict(svmmod,x)
+table(pred, y)
+```
+
+```{r, fig.show="hold", out.width="50%"}
+# threshold is
+svmmod$x.scale$`scaled:center`
+# plot classified with threshold calculated by SVM
+plot(area1[1,,,1], col = c("white", "black"), breaks = c(-35, svmmod$x.scale$`scaled:center`, 10))
+# vs old threshold
+# plot(all[1,,,1], col = c("white", "black"), breaks = c(-35, thresh$threshold, 10))
+ggplot(val.svm, aes(x=type, y=VV)) +
+  geom_boxplot() +
+  geom_hline(yintercept = svmmod$x.scale$`scaled:center`)
+```
+
+### Look at the End of June Again
+```{r, fig.show="hold", out.width="50%"}
+plot(area1[,,,14])
+plot(area1[,,,15])
+threshold <- -15.34187
+image(area1[,,,14], col = c("white", "black"), breaks = c(-35, threshold, 35), main="25.06., White is Smaller -15.3")
+image(area1[,,,15], col = c("white", "black"), breaks = c(-35, threshold, 35), main="07.07., White is Smaller -15.3")
+threshold <- svmmod$x.scale$`scaled:center`
+image(area1[,,,14], col = c("white", "black"), breaks = c(-35, threshold, 35), main="25.06., White is Smaller -18")
+image(area1[,,,15], col = c("white", "black"), breaks = c(-35, threshold, 35), main="07.07., White is Smaller -18")
+```
+
+## Next Steps
+
+* Make Sum Raster with New Water Threshold for both 2017 and 2018
+* Bring together training data from 2017, 2018 to calculate Threshold
+* Outlook: Final Analysis under the Research Question: How do surfaces with alternating moisture content behave in regard to rain?
+
+Sneak Peak:
+![2017](pic01.png)
+![2018](pic02_2018.png)

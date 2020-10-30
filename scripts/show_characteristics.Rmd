@@ -1,0 +1,129 @@
+---
+title: "Characterize by Change"
+author: "Jonathan Bahlmann"
+date: "10/27/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+library(e1071)
+```
+
+```{r loading-data, echo=FALSE}
+# load files as proxy
+int_VV_2017 <- read_stars("VV_2017_clip.tif", proxy=TRUE)
+int_VH_2017 <- read_stars("VH_2017_clip.tif", proxy=TRUE)
+int_VV_2018 <- read_stars("VV_clip.tif", proxy=TRUE)
+int_VH_2018 <- read_stars("VH_clip.tif", proxy=TRUE)
+# assign names
+names(int_VV_2017) <- "VV"
+names(int_VH_2017) <- "VH"
+names(int_VV_2018) <- "VV"
+names(int_VH_2018) <- "VH"
+# monitoring waters
+water_shape_2017 <- read_sf("water (copy).shp")
+water_shape_2018 <- read_sf("water.shp")
+water_shape_2017_july07 <- read_sf("water_shape_intersec.shp")
+# study area
+study_area <- read_sf("study_area.shp")
+# shape
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV_2018))
+# moni
+moni <- read_sf("moni_shap.shp")
+# double bounce
+db <- read_sf("double_bounce.shp")
+
+# water_general <- water_shape_2017[lengths(st_intersects(water_shape_2017, water_shape_2018)) != 0,]
+```
+
+## Characteristics
+
+Bands are:
+
+* change count 
+  + how often does the pixel change? -> count of change
+  + ranges from 0 to # of time steps
+  + higher values with more often change
+* change frequency 
+  + how stable is the pixel? -> mean of no-change-streaks
+  + ranges from 1 to # of time steps
+  + higher values correspond to longer periods of no change
+  + switch to the maximum of these periods?
+* change range 
+  + what magnitude does the change have? -> difference of max and min
+  + range dependent on max difference
+  + higher values indicate *one* high contrast event
+* mean
+  + range calculated
+  + higher values for a higher mean backscatter
+* threshold count
+  + count over the time period of one specific range of values -> how often were the pixels between a and b
+  + max is # of time steps
+  + high values depict high counts
+  
+```{r, warning=FALSE, fig.show="hold", out.width="50%"}
+sta <- read_stars("charac_five_attr/all_2017-01-08_2018-12-29.tif")
+study_area <- st_transform(study_area, crs=st_crs(sta))
+sta_small <- sta[study_area[1,]]
+plot(sta_small[,,,1], main = "Change Count")
+plot(sta_small[,,,2], main = "Change Frequency")
+plot(sta_small[,,,3], main = "Change Range")
+plot(sta_small[,,,4], main = "Mean")
+plot(sta_small[,,,5], main = "Threshold Count")
+```
+
+## Use Case Example: Count and Range
+
+* pixels that change often but not by much: high count and low range -> high +
+* pixels that change often and mostly with high range: high count, high range -> ~ 0
+* pixels that change not so often but if they do, they do by a lot: low count, high range -> low -
+* pixels that change not so often and if they do, they only change slightly: low count, low range -> ~ 0
+
+```{r, warning=FALSE}
+# conversion to raster scales to 0:255
+sta_small_count <- as(sta_small[,,,1], "Raster")
+sta_small_range <- as(sta_small[,,,3], "Raster")
+# NDI
+ras <- (sta_small_count - sta_small_range) / (sta_small_count + sta_small_range)
+# color
+colo = viridisLite::inferno(20)
+plot(ras, col = colo)
+```
+
+## Full Extent RGB: R = Count, G = Frequency, B = Range
+
+red -> much change, green -> much stability over time, blue -> high change amplitues
+```{r, warning=FALSE, out.width="100%"}
+ras <- raster::stack("charac_five_attr/all_2017-01-08_2018-12-29.tif")
+plotRGB(ras, r=1, g=2, b=3, stretch = "lin")
+```
+
+## Full Extent RGB: R = Count, G = Frequency, B = Threshold Count
+
+red -> much change, green -> much stability over time, blue -> high water threshold counts
+```{r, warning=FALSE, out.width="100%"}
+ras <- raster::stack("charac_five_attr/all_2017-01-08_2018-12-29.tif")
+ras <- crop(ras, study_area[1,])
+ras <- mask(ras, study_area[1,])
+plotRGB(ras, r=1, g=2, b=5, stretch = "lin")
+```
+
+## Further Possibillities
+
+* downscale / filter the tiles or the input rasters to account for speckle
+* band naming

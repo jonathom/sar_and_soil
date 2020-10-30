@@ -1,0 +1,156 @@
+---
+title: "Exploring 2019"
+author: "Jonathan Bahlmann"
+date: "10/29/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This is a summary on what I did during my internship at EFTAS in october 2020. The overall topic was to make a connection between SAR backscatter and soil moisture, also including precipitation data. The work can be split into two main approaches: the time series and the classification approach.
+
+# Data
+
+### Packages
+```{r libraries, warning=FALSE, message=FALSE}
+setwd("/home/petra/Praktikum")
+library(stars)
+library(dplyr)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(lubridate)
+library(sp)
+library(ggplot2)
+library(zoo)
+library(e1071)
+```
+
+### Intensity and Shapefiles
+The .tif files each contain data for a year. They are dB - scaled intensity measurements from Sentinel 1 A. All scenes have a offset of 12 days, except for a data gap in January 2017.
+```{r loading-int-data}
+# load files as proxy
+int_VV <- read_stars("./BEWAMO_NEU/S1A-VV-Multilook-Speckle-Gamma0.tif", proxy=TRUE)
+# assign names
+names(int_VV) <- "VV"
+# study area
+study_area <- read_sf("study_area.shp")
+study_area <- st_transform(study_area, crs=st_crs(int_VV))
+# shape
+shape <- read_sf("antragsfl_16_17_18.shp")
+shape <- st_transform(shape, crs=st_crs(int_VV))
+
+int_VV
+
+```
+
+Dates of scenes are read via `gdalinfo()`.
+```{r make-dates}
+# make dates
+info = gdalinfo("./BEWAMO_NEU/S1A-VV-Multilook-Speckle-Gamma0.tif")
+descr = info[grepl(info, pattern = "Description = ")]
+descr = gsub(descr, pattern = "Description = ", replacement = "")
+dates <- as_date(descr)
+```
+
+```{r load-polygon-func}
+# function takes a shape as an AOI and a year (2017 or 2018)
+loadPolygon <- function(shape, interval) {
+  dates <- dates[interval[1]:interval[2]]
+  int_vv <- st_as_stars(int_VV[shape], along = "band")
+  int_vv <- int_vv[,,,interval[1]:interval[2]]
+  int_vv <- st_set_dimensions(int_vv, 3, val = dates, names = "time")
+  names(int_vv) <- c("VV")
+  return(int_vv)
+}
+```
+
+```{r}
+# explore
+area1 <- loadPolygon(study_area[4,], c(25,44))
+df <- st_apply(area1, "time", mean, na.rm=TRUE) %>% as.data.frame()
+plot(mean ~ time, df, type="l")
+```
+
+```{r}
+measures <- read.csv("Bodenfeuchte_Rhinluch.csv")
+measures <- measures[3:nrow(measures),c(1,6,7,8)]
+names(measures) <- c("time", "sensor1", "sensor2", "waterlevel")
+measures$time <- dmy(as.character(measures$time))
+
+measures <- aggregate(measures[c("sensor1", "sensor2", "waterlevel")], mean, by = list(Group.date = measures$time))
+names(measures) <- c("time", "sensor1", "sensor2", "waterlevel")
+measures$sensorMean <- rowMeans(measures[,2:3])
+
+# location is already in WGS84
+loc <- st_point(c(12.92506, 52.83639))
+loc <- st_sfc(loc, crs=4326)
+
+# extract
+point_meas <- st_extract(area1, pts = loc) %>% as.data.frame()
+
+ggplot() +
+  geom_line(aes(x = measures$time, y = measures$sensorMean)) +  
+  geom_smooth(aes(x = measures$time, y = measures$sensorMean), span = 0.9, color = "darkblue") + 
+  geom_line(aes(x = point_meas$time, y = point_meas$VV * 150 + 45)) +
+  geom_smooth(aes(x = point_meas$time, y = point_meas$VV * 150 + 45), span = 0.8, color = "red") +
+  coord_cartesian(ylim=c(40,60))
+
+ggplot() +
+  geom_line(aes(x = measures$time, y = measures$sensorMean)) +  
+  geom_smooth(aes(x = measures$time, y = measures$sensorMean), span = 0.25, color = "darkblue") + 
+  geom_line(aes(x = point_meas$time, y = point_meas$VV * 150 + 45)) +
+  geom_smooth(aes(x = point_meas$time, y = point_meas$VV * 150 + 45), span = 0.3, color = "red") +
+  coord_cartesian(ylim=c(40,60))
+  
+  # scale_color_manual(name = "Förderung", values = c("Sensor mean"="darkblue"))
+
+ #  geom_line(aes(x = measures$time, y = measures$waterlevel / 10 - 50))
+```
+
+```{r}
+measures <- read.csv("lentzke.csv")
+measures <- measures[3:nrow(measures),c(1,6,7,8)]
+names(measures) <- c("time", "sensor1", "sensor2", "waterlevel")
+measures$time <- mdy(as.character(measures$time))
+
+measures <- aggregate(measures[c("sensor1", "sensor2", "waterlevel")], mean, by = list(Group.date = measures$time))
+names(measures) <- c("time", "sensor1", "sensor2", "waterlevel")
+measures$sensorMean <- rowMeans(measures[,2:3])
+
+# location is already in WGS84
+loc <- st_point(c(12.74090, 52.81763))
+loc <- st_sfc(loc, crs=4326)
+
+# extract
+point_meas <- st_extract(area1, pts = loc) %>% as.data.frame()
+
+ggplot() +
+  geom_line(aes(x = measures$time, y = measures$sensorMean)) +  
+  geom_line(aes(x = point_meas$time, y = point_meas$VV * 100 + 43)) +
+  coord_cartesian(ylim=c(40,60))
+```
+
+```{r}
+measures <- read.csv("mf.csv")
+measures <- measures[3:nrow(measures),c(1,6,7,8)]
+names(measures) <- c("time", "sensor1", "sensor2", "waterlevel")
+measures$time <- mdy(as.character(measures$time))
+
+measures <- aggregate(measures[c("sensor1", "sensor2", "waterlevel")], mean, by = list(Group.date = measures$time))
+names(measures) <- c("time", "sensor1", "sensor2", "waterlevel")
+measures$sensorMean <- rowMeans(measures[,2:3])
+
+# location is already in WGS84
+loc <- st_point(c(12.80042, 52.83602))
+loc <- st_sfc(loc, crs=4326)
+
+# extract
+point_meas <- st_extract(area1, pts = loc) %>% as.data.frame()
+
+ggplot() +
+  geom_line(aes(x = measures$time, y = measures$sensorMean)) +  
+  geom_line(aes(x = point_meas$time, y = point_meas$VV * 300 + 18))
+```
